@@ -3,13 +3,58 @@ package localstore
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	"example.com/etl/internal/model"
 )
+
+func TestSnapshotPairsRowsAndCheckpointDuringCommits(t *testing.T) {
+	s := openTest(t, t.TempDir())
+	empty, err := s.Snapshot("instance-1", "orders")
+	if err != nil || empty.Rows == nil || len(empty.Rows) != 0 || empty.Checkpoint.Sequence != 0 {
+		t.Fatalf("initial snapshot: %+v %v", empty, err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		for n := 1; n <= 20; n++ {
+			r := request()
+			r.Sequence = uint64(n)
+			r.TransactionID = fmt.Sprintf("tx-%d", n)
+			r.ResumeAfter.Offset = uint32(n * 100)
+			r.Records[0].MutationID = fmt.Sprintf("mutation-%d", n)
+			r.Records[0].Mutation.Value["total"] = strconv.Itoa(n)
+			if _, err := s.Commit(context.Background(), r); err != nil {
+				done <- err
+				return
+			}
+		}
+		done <- nil
+	}()
+	for n := 0; n < 50; n++ {
+		snapshot, err := s.Snapshot("instance-1", "orders")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if snapshot.Checkpoint.Sequence == 0 {
+			continue
+		}
+		if len(snapshot.Rows) != 1 || snapshot.Rows[0]["total"] != fmt.Sprint(snapshot.Checkpoint.Sequence) || snapshot.Checkpoint.Position.Offset != uint32(snapshot.Checkpoint.Sequence*100) {
+			t.Fatalf("rows and cursor describe different commits: %+v", snapshot)
+		}
+	}
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	final, err := s.Snapshot("instance-1", "orders")
+	if err != nil || final.Checkpoint.Sequence != 20 || final.Rows[0]["total"] != "20" {
+		t.Fatalf("final snapshot: %+v %v", final, err)
+	}
+}
 
 func request() CommitRequest {
 	return CommitRequest{
@@ -48,12 +93,12 @@ func TestCommitRecoveryAndDelete(t *testing.T) {
 	if e != nil || !ok || got != cp {
 		t.Fatalf("checkpoint: %+v %v %v", got, ok, e)
 	}
-	rows, e := s.Rows(r.InstanceID, "orders")
-	if e != nil || len(rows) != 1 || rows[0]["id"] != "18446744073709551615" || rows[0]["total"] != "1234567890123456.78" {
+	rows, e := s.Snapshot(r.InstanceID, "orders")
+	if e != nil || len(rows.Rows) != 1 || rows.Rows[0]["id"] != "18446744073709551615" || rows.Rows[0]["total"] != "1234567890123456.78" {
 		t.Fatalf("lossy rows: %#v %v", rows, e)
 	}
-	audit, e := s.Rows(r.InstanceID, "audit")
-	if e != nil || len(audit) != 0 {
+	audit, e := s.Snapshot(r.InstanceID, "audit")
+	if e != nil || len(audit.Rows) != 0 {
 		t.Fatal(audit, e)
 	}
 	r.Sequence = 2
@@ -65,8 +110,8 @@ func TestCommitRecoveryAndDelete(t *testing.T) {
 	if _, e = s.Commit(context.Background(), r); e != nil {
 		t.Fatal(e)
 	}
-	rows, e = s.Rows(r.InstanceID, "orders")
-	if e != nil || len(rows) != 0 {
+	rows, e = s.Snapshot(r.InstanceID, "orders")
+	if e != nil || len(rows.Rows) != 0 {
 		t.Fatal(rows, e)
 	}
 	commits, e := s.Commits(r.InstanceID)
@@ -117,8 +162,8 @@ func TestConflictAndCrashBeforePublish(t *testing.T) {
 	if e != nil || ok {
 		t.Fatal("uncommitted checkpoint", ok, e)
 	}
-	rows, e := s.Rows(r.InstanceID, "orders")
-	if e != nil || len(rows) != 0 {
+	rows, e := s.Snapshot(r.InstanceID, "orders")
+	if e != nil || len(rows.Rows) != 0 {
 		t.Fatal("uncommitted rows visible", rows, e)
 	}
 	entries, e := os.ReadDir(filepath.Join(root, r.InstanceID))

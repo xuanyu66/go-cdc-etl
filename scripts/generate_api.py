@@ -39,7 +39,7 @@ schemas = {
  "Version": obj({"version_id": text(), "pipeline_id": text(), "draft_revision": text(), "plan": ref("Plan")}),
  "Instance": obj({"instance_id": text(), "pipeline_id": text(), "version_id": text(), "state": {"enum": ["STARTING", "RUNNING", "PAUSING", "PAUSED"]}, "desired_state": {"enum": ["RUNNING", "PAUSED"]}, "last_error": text(), "initial_position": position, "source_id": text(), "replication_server_id": integer(), "schemas": {"type": "object", "additionalProperties": array(obj({"name": text(), "type": text(), "required": {"type": "boolean"}}))}}, ["instance_id", "pipeline_id", "version_id", "state", "desired_state", "initial_position", "source_id", "replication_server_id", "schemas"]),
  "Checkpoint": obj({"sequence": integer(minimum=0), "transaction_id": text(), "version_id": text(), "position": position}),
- "Rows": obj({"rows": array({"type": "object", "additionalProperties": True})}),
+ "Rows": obj({"rows": array({"type": "object", "additionalProperties": True}), "checkpoint": ref("Checkpoint")}),
  "DraftPage": obj({"items": array(ref("Draft"))}),
  "Probe": obj({"position": position, "server_uuid": text(), "tables": {"type": "object", "additionalProperties": array({"type": "object"})}}),
  "Object": {"type": "object"},

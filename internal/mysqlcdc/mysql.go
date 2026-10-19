@@ -117,7 +117,9 @@ func Probe(ctx context.Context, c Connection, tables []string) (ProbeResult, err
 			nullable, _ := r.GetString(i, 2)
 			charset, _ := r.GetString(i, 3)
 			extra, _ := r.GetString(i, 4)
-			if !supported(t) || strings.Contains(strings.ToUpper(extra), "GENERATED") || strings.Contains(strings.ToUpper(extra), "INVISIBLE") {
+			extra = strings.ToUpper(extra)
+			generated := strings.Contains(extra, "VIRTUAL GENERATED") || strings.Contains(extra, "STORED GENERATED")
+			if !supported(t) || generated || strings.Contains(extra, "INVISIBLE") {
 				return out, fmt.Errorf("unsupported source column %s.%s (%s, %s)", table, n, t, extra)
 			}
 			if charset != "" && charset != "binary" && charset != "utf8mb4" && charset != "utf8mb3" && charset != "utf8" && charset != "ascii" {

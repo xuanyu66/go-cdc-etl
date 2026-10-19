@@ -440,14 +440,15 @@ func (s *Server) routes() {
 			problem(w, fail(404, "NOT_FOUND", "output not found"))
 			return
 		}
-		rows, err := s.store.Rows(id, output)
+		snapshot, err := s.store.Snapshot(id, output)
 		if err != nil {
 			problem(w, err)
 			return
 		}
-		if rows == nil {
-			rows = []map[string]any{}
+		if snapshot.Checkpoint.Sequence == 0 {
+			snapshot.Checkpoint.Position = i.InitialPosition
+			snapshot.Checkpoint.VersionID = i.VersionID
 		}
-		writeJSON(w, 200, map[string]any{"rows": rows})
+		writeJSON(w, 200, snapshot)
 	})
 }

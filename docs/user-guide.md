@@ -80,10 +80,18 @@ docker compose exec -T mysql mysql -uroot -petl-demo-root -e \
 curl -sS "http://127.0.0.1:8080/v1/instances/$INSTANCE_ID/outputs/orders"
 ```
 
-异步处理完成后，结果包含：
+异步处理完成后，结果包含（checkpoint 的 ID 和位点为示意值）：
 
 ```json
-{"rows":[{"order_id":"1001","customer_id":"7","total":"24.68"}]}
+{
+  "rows":[{"order_id":"1001","customer_id":"7","total":"24.68"}],
+  "checkpoint":{
+    "sequence":1,
+    "transaction_id":"source-transaction-id",
+    "version_id":"ver_example",
+    "position":{"file":"mysql-bin.000003","position":25813}
+  }
+}
 ```
 
 示例只输出 paid 订单，金额通过精确小数乘以 2。然后分别验证更新和删除（每条执行后轮询输出）：
@@ -226,7 +234,7 @@ columns 实际包含整张表的列。insert 的 before、delete 的 after 为 `
 | `POST /v1/instances/{instance_id}/pause` | `{}` → 202，异步取消在途工作并保留安全 checkpoint |
 | `POST /v1/instances/{instance_id}/resume` | `{}` → 202，从已有 checkpoint 启动 |
 | `GET /v1/instances/{instance_id}/checkpoint` | 已提交 sequence、事务 ID、version、file/position；初始 sequence=0 |
-| `GET /v1/instances/{instance_id}/outputs/{output}` | `{ "rows": [...] }`，只读取已提交结果，无分页 |
+| `GET /v1/instances/{instance_id}/outputs/{output}` | `{ "rows": [...], "checkpoint": {...} }`，同一提交快照的数据和进度，无分页 |
 
 首次实例请求无需用户上传 schema_baseline_ref：服务从当前来源采集并固定基线。后续恢复拒绝源 server UUID 变化和 schema 变化；不自动重新取起点或补全已有表数据。
 
@@ -256,6 +264,17 @@ curl --fail-with-body -sS http://127.0.0.1:8080/v1/functions \
 ```
 
 常见状态码：400 请求/幂等键错误，404 资源不存在，409 名称/状态/幂等冲突，412 草稿版本不符，413 超大请求，415 Content-Type 错误，422 结构/能力/函数/schema 错误，428 缺少 If-Match，503 服务关闭。来源不可用等问题当前可能以 422 返回，MVP 尚未精细分类为可重试网络错误；客户端应读取 detail，不无条件重试。
+
+### Output 中的同步位点
+
+output 响应的 `checkpoint` 表示返回的 **rows 已应用到的完整事务边界**，与单独的 checkpoint 接口结构相同。服务在同一存储锁内，从同一份 manifest 历史生成 rows 和 checkpoint；不会先读旧数据再配上新位点。
+
+- `sequence` 是实例内已提交事务序号，不是 GTID；`transaction_id` 是对应的源事务身份。
+- `position.file/position` 是该提交之后的恢复位置，不是 listener 已读取但尚未提交的位置。
+- 实例尚未提交时，rows 为空，sequence 为 0，position 为初始增量起点；这不表示初始点之前的数据已导出。
+- 全过滤事务、无关表事务及可安全跳过的无关 DDL，也可推进 checkpoint，rows 不一定变化。
+- 更新是异步的；SQL 成功后轮询 output，检查目标值或位点。可与 SQL 提交后 `SHOW BINARY LOG STATUS` 获取的源位置比较；同一文件比较 position，跨文件按源 binlog 文件顺序比较，不能只比数字偏移。
+- checkpoint 不保证随后再查询 MySQL 时源端没有继续产生新数据，也不保证任意一次 GET 都已追平源端。
 
 ## 8. 暂停、恢复、错误与 DDL
 

@@ -324,12 +324,21 @@ func (s *Store) Commits(id string) ([]CommitRequest, error) {
 	defer s.mu.Unlock()
 	return s.commits(id)
 }
-func (s *Store) Rows(id, output string) ([]map[string]any, error) {
+
+// OutputSnapshot couples materialized rows to their exact committed source cursor.
+type OutputSnapshot struct {
+	Rows       []map[string]any `json:"rows"`
+	Checkpoint Checkpoint       `json:"checkpoint"`
+}
+
+// Snapshot holds the store lock while loading one committed history and deriving
+// both rows and checkpoint. A separate Checkpoint call would race with Commit.
+func (s *Store) Snapshot(id, output string) (OutputSnapshot, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	commits, e := s.commits(id)
 	if e != nil {
-		return nil, e
+		return OutputSnapshot{}, e
 	}
 	rows := map[string]map[string]any{}
 	for _, c := range commits {
@@ -361,7 +370,7 @@ func (s *Store) Rows(id, output string) ([]map[string]any, error) {
 			}
 			b, e := json.Marshal(canonical)
 			if e != nil {
-				return nil, e
+				return OutputSnapshot{}, e
 			}
 			key := string(b)
 			if m.Operation == "delete" {
@@ -380,5 +389,9 @@ func (s *Store) Rows(id, output string) ([]map[string]any, error) {
 	for _, k := range keys {
 		out = append(out, rows[k])
 	}
-	return out, nil
+	checkpoint := Checkpoint{}
+	if len(commits) > 0 {
+		checkpoint = cp(commit{Request: commits[len(commits)-1]})
+	}
+	return OutputSnapshot{Rows: out, Checkpoint: checkpoint}, nil
 }

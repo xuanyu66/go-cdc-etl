@@ -45,8 +45,14 @@ func TestMySQLLuaLocal(t *testing.T) {
 	}
 	h := &harness{t: t, root: root}
 	table := fmt.Sprintf("e2e_orders_%d", time.Now().UnixNano())
+	timestampTable := fmt.Sprintf("e2e_timestamp_defaults_%d", time.Now().UnixNano())
+	generatedTable := fmt.Sprintf("e2e_generated_column_%d", time.Now().UnixNano())
 	h.sql("CREATE TABLE shop." + table + " (id BIGINT UNSIGNED PRIMARY KEY, customer_id BIGINT NOT NULL, amount DECIMAL(18,2) NOT NULL, status VARCHAR(32) NOT NULL) ENGINE=InnoDB")
 	defer h.sql("DROP TABLE IF EXISTS shop." + table)
+	h.sql("CREATE TABLE shop." + timestampTable + " (id BIGINT PRIMARY KEY, created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP) ENGINE=InnoDB")
+	defer h.sql("DROP TABLE IF EXISTS shop." + timestampTable)
+	h.sql("CREATE TABLE shop." + generatedTable + " (id INT PRIMARY KEY, derived INT GENERATED ALWAYS AS (id + 1) STORED) ENGINE=InnoDB")
+	defer h.sql("DROP TABLE IF EXISTS shop." + generatedTable)
 	h.sql("INSERT INTO shop." + table + " VALUES (99, 7, 9.99, 'paid')")
 	worker := filepath.Join(t.TempDir(), "etl")
 	build := exec.Command("go", "build", "-o", worker, "./cmd/etl")
@@ -57,6 +63,12 @@ func TestMySQLLuaLocal(t *testing.T) {
 	cfg := server.Config{DataDir: t.TempDir(), WorkerExecutable: worker, MySQL: mysqlcdc.Connection{Addr: addr, User: "etl", Password: "etl-demo-password", ServerID: 80301}}
 	h.open(cfg)
 	defer h.close()
+	var timestampProbe mysqlcdc.ProbeResult
+	h.request(http.MethodGet, "/v1/connections/mysql-local/inspect?tables=shop."+timestampTable, "", nil, http.StatusOK, &timestampProbe)
+	if len(timestampProbe.Tables["shop."+timestampTable]) != 3 {
+		t.Fatalf("ordinary TIMESTAMP defaults were not accepted by inspect: %+v", timestampProbe)
+	}
+	h.request(http.MethodGet, "/v1/connections/mysql-local/inspect?tables=shop."+generatedTable, "", nil, http.StatusUnprocessableEntity, nil)
 
 	const source = `function transform(event)
   local old = event.before
@@ -499,9 +511,13 @@ func (h *harness) rows(id string) []map[string]any {
 func (h *harness) outputRows(id, output string) []map[string]any {
 	h.t.Helper()
 	var res struct {
-		Rows []map[string]any `json:"rows"`
+		Rows       []map[string]any      `json:"rows"`
+		Checkpoint localstore.Checkpoint `json:"checkpoint"`
 	}
 	h.request(http.MethodGet, "/v1/instances/"+id+"/outputs/"+output, "", nil, http.StatusOK, &res)
+	if res.Checkpoint.Position.File == "" || res.Checkpoint.VersionID == "" {
+		h.t.Fatalf("output response omitted its applied checkpoint: %+v", res)
+	}
 	return res.Rows
 }
 func (h *harness) eventually(label string, f func() bool) {
