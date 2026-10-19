@@ -94,17 +94,17 @@ func newState(ctx context.Context) (*lua.LState, *lua.LUserData) {
 // entrypoint. Runtime output validation happens when real events are supplied.
 func Validate(source string) error {
 	if len(source) > MaxRequestBytes {
-		return errors.New("Lua source exceeds 1 MiB")
+		return errors.New("lua source exceeds 1 MiB")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	l, _ := newState(ctx)
 	defer l.Close()
 	if err := l.DoString(source); err != nil {
-		return fmt.Errorf("Lua initialization: %w", err)
+		return fmt.Errorf("lua initialization: %w", err)
 	}
 	if l.GetGlobal("transform").Type() != lua.LTFunction {
-		return errors.New("Lua source must define function transform(event)")
+		return errors.New("lua source must define function transform(event)")
 	}
 	return nil
 }
@@ -149,7 +149,7 @@ func executeEvent(ctx context.Context, source string, event model.Event) ([]mode
 	l, null := newState(ctx)
 	defer l.Close()
 	if err := l.DoString(source); err != nil {
-		return nil, fmt.Errorf("Lua initialization: %w", err)
+		return nil, fmt.Errorf("lua initialization: %w", err)
 	}
 	fn := l.GetGlobal("transform")
 	if fn.Type() != lua.LTFunction {
@@ -170,7 +170,7 @@ func executeEvent(ctx context.Context, source string, event model.Event) ([]mode
 		return nil, err
 	}
 	if err := l.CallByParam(lua.P{Fn: fn, NRet: 1, Protect: true}, arg); err != nil {
-		return nil, fmt.Errorf("Lua transform: %w", err)
+		return nil, fmt.Errorf("lua transform: %w", err)
 	}
 	result, ok := l.Get(-1).(*lua.LTable)
 	if !ok {
@@ -420,16 +420,16 @@ func (p Process) Execute(ctx context.Context, req model.TransformRequest) (model
 	cmd.Stderr = stderr
 	if err := cmd.Run(); err != nil {
 		if ctx.Err() != nil {
-			return model.TransformResponse{}, fmt.Errorf("Lua worker: %w", ctx.Err())
+			return model.TransformResponse{}, fmt.Errorf("lua worker: %w", ctx.Err())
 		}
-		return model.TransformResponse{}, fmt.Errorf("Lua worker: %w: %s", err, stderr.String())
+		return model.TransformResponse{}, fmt.Errorf("lua worker: %w: %s", err, stderr.String())
 	}
 	var res model.TransformResponse
 	dec := json.NewDecoder(bytes.NewReader(stdout.Bytes()))
 	dec.UseNumber()
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&res); err != nil {
-		return model.TransformResponse{}, fmt.Errorf("Lua worker response: %w", err)
+		return model.TransformResponse{}, fmt.Errorf("lua worker response: %w", err)
 	}
 	if err := dec.Decode(new(any)); err != io.EOF {
 		return model.TransformResponse{}, errors.New("unexpected trailing worker response")
@@ -438,7 +438,7 @@ func (p Process) Execute(ctx context.Context, req model.TransformRequest) (model
 		return model.TransformResponse{}, errors.New(res.Error)
 	}
 	if len(res.Results) != len(req.Events) {
-		return model.TransformResponse{}, errors.New("Lua worker returned wrong event count")
+		return model.TransformResponse{}, errors.New("lua worker returned wrong event count")
 	}
 	return res, nil
 }

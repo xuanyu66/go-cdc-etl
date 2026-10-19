@@ -30,6 +30,7 @@ func NewMemoryStore(now func() time.Time) *MemoryStore {
 	}
 	return &MemoryStore{now: now, states: make(map[Scope]*memoryState)}
 }
+
 func (m *MemoryStore) Acquire(ctx context.Context, scope Scope, owner string, ttl time.Duration) (Lease, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -51,6 +52,7 @@ func (m *MemoryStore) Acquire(ctx context.Context, scope Scope, owner string, tt
 	s.lease = Lease{Scope: scope, Owner: owner, Fence: s.lastFence, ExpiresAt: m.now().Add(ttl)}
 	return s.lease, nil
 }
+
 func (m *MemoryStore) owned(l Lease) (*memoryState, error) {
 	s := m.states[l.Scope]
 	if s == nil || l.Fence != s.lease.Fence || l.Owner != s.lease.Owner || !m.now().Before(s.lease.ExpiresAt) {
@@ -58,6 +60,7 @@ func (m *MemoryStore) owned(l Lease) (*memoryState, error) {
 	}
 	return s, nil
 }
+
 func (m *MemoryStore) Renew(ctx context.Context, l Lease, ttl time.Duration) (Lease, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -74,6 +77,7 @@ func (m *MemoryStore) Renew(ctx context.Context, l Lease, ttl time.Duration) (Le
 	s.lease.ExpiresAt = m.now().Add(ttl)
 	return s.lease, nil
 }
+
 func (m *MemoryStore) Load(ctx context.Context, scope Scope) (Cursor, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -85,8 +89,11 @@ func (m *MemoryStore) Load(ctx context.Context, scope Scope) (Cursor, error) {
 	}
 	return Cursor{}, nil
 }
+
 func clonePrepared(p Prepared) Prepared { p.Required = append([]Write(nil), p.Required...); return p }
-func cloneReceipt(r Receipt) Receipt    { r.Objects = append([]Object(nil), r.Objects...); return r }
+
+func cloneReceipt(r Receipt) Receipt { r.Objects = append([]Object(nil), r.Objects...); return r }
+
 func cloneRecord(r CommitRecord) CommitRecord {
 	r.Receipts = append([]Receipt(nil), r.Receipts...)
 	for i := range r.Receipts {
@@ -94,6 +101,7 @@ func cloneRecord(r CommitRecord) CommitRecord {
 	}
 	return r
 }
+
 func (m *MemoryStore) Prepare(ctx context.Context, l Lease, expectedRevision uint64, p Prepared) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -173,6 +181,7 @@ func (m *MemoryStore) RecordReceipt(ctx context.Context, l Lease, sequence uint6
 	s.receipts[receipt.Write] = cloneReceipt(receipt)
 	return nil
 }
+
 func (m *MemoryStore) Commit(ctx context.Context, l Lease, expectedRevision, sequence uint64) (CommitRecord, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

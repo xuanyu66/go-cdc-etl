@@ -18,6 +18,7 @@ func fixture(t *testing.T) Definition {
 	}
 	return d
 }
+
 func TestCompileMVP(t *testing.T) {
 	d := fixture(t)
 	a, err := Compile(d)
@@ -37,6 +38,7 @@ func TestCompileMVP(t *testing.T) {
 		t.Fatal("node/edge order changed plan identity")
 	}
 }
+
 func TestRejectUnsupportedCapabilities(t *testing.T) {
 	cases := map[string]func(*Definition){
 		"wildcard":         func(d *Definition) { d.Spec.Nodes[0].MySQL.Tables = []string{"shop.*"} },
@@ -58,6 +60,7 @@ func TestRejectUnsupportedCapabilities(t *testing.T) {
 		})
 	}
 }
+
 func TestStrictDecode(t *testing.T) {
 	d := fixture(t)
 	raw, _ := json.Marshal(d)

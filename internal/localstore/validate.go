@@ -13,8 +13,10 @@ import (
 	"example.com/etl/internal/model"
 )
 
-var decimalType = regexp.MustCompile(`^decimal\(([1-9][0-9]*),([0-9]+)\)$`)
-var decimalValue = regexp.MustCompile(`^-?(0|[1-9][0-9]*)(\.[0-9]+)?$`)
+var (
+	decimalType  = regexp.MustCompile(`^decimal\(([1-9][0-9]*),([0-9]+)\)$`)
+	decimalValue = regexp.MustCompile(`^-?(0|[1-9][0-9]*)(\.[0-9]+)?$`)
+)
 
 // Validate checks the output contract and every mutation before any file is written.
 // Exact integer/decimal values cross the transform boundary as strings.
@@ -122,6 +124,7 @@ func Validate(outputs []model.Output, records []model.Envelope) error {
 	}
 	return nil
 }
+
 func validType(t string) error {
 	switch t {
 	case "string", "bool", "int64", "uint64", "float64":
@@ -133,6 +136,7 @@ func validType(t string) error {
 	}
 	return fmt.Errorf("unsupported type %q (decimal precision must be <= 38)", t)
 }
+
 func decimalParts(t string) (int, int, bool) {
 	m := decimalType.FindStringSubmatch(t)
 	if m == nil {
@@ -145,6 +149,7 @@ func decimalParts(t string) (int, int, bool) {
 	s, e := strconv.Atoi(m[2])
 	return p, s, e == nil
 }
+
 func checkValue(t string, v any) error {
 	switch t {
 	case "string":

@@ -37,7 +37,7 @@ func TestOutputIncludesSnapshotCheckpoint(t *testing.T) {
 	get := func() localstore.OutputSnapshot {
 		t.Helper()
 		w := httptest.NewRecorder()
-		s.ServeHTTP(w, httptest.NewRequest("GET", "/v1/instances/instance-1/outputs/orders", nil))
+		s.ServeHTTP(w, httptest.NewRequestWithContext(context.Background(), "GET", "/v1/instances/instance-1/outputs/orders", nil))
 		if w.Code != 200 {
 			t.Fatalf("output response: %d %s", w.Code, w.Body.String())
 		}
@@ -81,7 +81,7 @@ func TestDraftVersionsIdempotencyAndPersistence(t *testing.T) {
 	s.data.Functions["REPLACE_WITH_FUNCTION_ID"] = Function{ID: "REPLACE_WITH_FUNCTION_ID", Source: "function transform(e) return {} end"}
 	request := func(method, path, key, etag string, raw []byte) *httptest.ResponseRecorder {
 		t.Helper()
-		r := httptest.NewRequest(method, path, bytes.NewReader(raw))
+		r := httptest.NewRequestWithContext(context.Background(), method, path, bytes.NewReader(raw))
 		r.Header.Set("Content-Type", "application/json")
 		r.Header.Set("Idempotency-Key", key)
 		r.Header.Set("If-Match", etag)
@@ -139,13 +139,14 @@ func TestDraftVersionsIdempotencyAndPersistence(t *testing.T) {
 		t.Fatalf("idempotency did not survive restart: %s", w.Body.String())
 	}
 }
+
 func TestHTTPRejectsDuplicateKeysAndBrowserMutations(t *testing.T) {
 	s, err := Open(context.Background(), Config{DataDir: t.TempDir(), WorkerExecutable: os.Args[0]})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer s.Close(context.Background())
-	r := httptest.NewRequest("POST", "/v1/functions", bytes.NewBufferString(`{"name":"a","name":"b","source":"x"}`))
+	r := httptest.NewRequestWithContext(context.Background(), "POST", "/v1/functions", bytes.NewBufferString(`{"name":"a","name":"b","source":"x"}`))
 	r.Header.Set("Content-Type", "application/json")
 	r.Header.Set("Idempotency-Key", "duplicate")
 	w := httptest.NewRecorder()
@@ -153,7 +154,7 @@ func TestHTTPRejectsDuplicateKeysAndBrowserMutations(t *testing.T) {
 	if w.Code != 400 {
 		t.Fatalf("duplicate keys accepted: %d %s", w.Code, w.Body.String())
 	}
-	r = httptest.NewRequest("POST", "/v1/functions", bytes.NewBufferString(`{}`))
+	r = httptest.NewRequestWithContext(context.Background(), "POST", "/v1/functions", bytes.NewBufferString(`{}`))
 	r.Header.Set("Origin", "https://example.com")
 	w = httptest.NewRecorder()
 	s.ServeHTTP(w, r)

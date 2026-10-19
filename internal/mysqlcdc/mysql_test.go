@@ -30,6 +30,7 @@ func TestLosslessRow(t *testing.T) {
 		}
 	}
 }
+
 func TestRejectCorruptRows(t *testing.T) {
 	cols := []model.Column{{Name: "v", Type: "varchar(10)", Required: true}}
 	for _, row := range [][]any{{}, {nil}, {string([]byte{255})}} {
@@ -38,6 +39,7 @@ func TestRejectCorruptRows(t *testing.T) {
 		}
 	}
 }
+
 func TestSchemaWireValidation(t *testing.T) {
 	cols := []model.Column{{Name: "id", Type: "bigint unsigned"}, {Name: "label", Type: "varchar(20)"}}
 	table := &replication.TableMapEvent{ColumnCount: 2, ColumnType: []byte{mysql.MYSQL_TYPE_LONGLONG, mysql.MYSQL_TYPE_VARCHAR}}
@@ -53,8 +55,11 @@ func TestSchemaWireValidation(t *testing.T) {
 		t.Fatal("accepted changed count")
 	}
 }
+
 func TestIdentityStableAndSeparated(t *testing.T) {
-	if identity("source", "file", "10") != identity("source", "file", "10") {
+	first := identity("source", "file", "10")
+	second := identity("source", "file", "10")
+	if first != second {
 		t.Fatal("unstable")
 	}
 	if identity("ab", "c") == identity("a", "bc") {
@@ -64,6 +69,7 @@ func TestIdentityStableAndSeparated(t *testing.T) {
 		t.Fatal("positions collide")
 	}
 }
+
 func TestUnsupportedTypesAndTables(t *testing.T) {
 	for _, typ := range []string{"enum('a','b')", "set('a')", "float", "double", "bit(8)", "geometry"} {
 		if supported(typ) {

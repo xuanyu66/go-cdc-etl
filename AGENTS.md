@@ -12,10 +12,11 @@ MySQL binlog CDC → 用户 Lua 转换 → 本地幂等 JSONL 落盘 + 原子提
 make mysql-up    # 启动 MySQL 8.4 容器（127.0.0.1:13306，e2e 前置）
 make build       # 产出 bin/etl
 make test        # go test ./...（不含需数据库的 e2e）
+make lint        # golangci-lint 全量检查（需安装 golangci-lint）
 make e2e         # 真实 MySQL + HTTP API + Lua 子进程的集成测试，需先 mysql-up
 ```
 
-提交前必须满足：`gofmt`/`go vet` 干净、`make test` 全绿；改了 CDC/幂等/生命周期逻辑时跑 `make e2e`。
+提交前必须满足：`make lint` 零 issue、`make test` 全绿；改了 CDC/幂等/生命周期逻辑时跑 `make e2e`。
 
 ## 目录速查
 

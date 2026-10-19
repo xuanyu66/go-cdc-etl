@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -21,7 +22,7 @@ import (
 
 func run(args []string, out io.Writer) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: etl serve | validate -file pipeline.json")
+		return errors.New("usage: etl serve | validate -file pipeline.json")
 	}
 	switch args[0] {
 	case "lua-worker":
@@ -33,7 +34,7 @@ func run(args []string, out io.Writer) error {
 			return err
 		}
 		if *path == "" || flags.NArg() != 0 {
-			return fmt.Errorf("-file is required")
+			return errors.New("-file is required")
 		}
 		f, err := os.Open(*path)
 		if err != nil {
@@ -65,7 +66,7 @@ func run(args []string, out io.Writer) error {
 			return err
 		}
 		if flags.NArg() != 0 {
-			return fmt.Errorf("unexpected arguments")
+			return errors.New("unexpected arguments")
 		}
 		host, _, err := net.SplitHostPort(*addr)
 		if err != nil {
@@ -73,7 +74,7 @@ func run(args []string, out io.Writer) error {
 		}
 		ip := net.ParseIP(host)
 		if ip == nil || !ip.IsLoopback() {
-			return fmt.Errorf("local MVP only permits numeric loopback listen addresses")
+			return errors.New("local MVP only permits numeric loopback listen addresses")
 		}
 		exe, err := os.Executable()
 		if err != nil {
@@ -86,9 +87,9 @@ func run(args []string, out io.Writer) error {
 			return err
 		}
 		httpServer := &http.Server{Addr: *addr, Handler: s, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 15 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
-		listener, err := net.Listen("tcp", *addr)
+		listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", *addr)
 		if err != nil {
-			s.Close(context.Background())
+			_ = s.Close(context.Background())
 			return err
 		}
 		errCh := make(chan error, 1)
@@ -97,7 +98,7 @@ func run(args []string, out io.Writer) error {
 		select {
 		case <-ctx.Done():
 		case err = <-errCh:
-			if err == http.ErrServerClosed {
+			if errors.Is(err, http.ErrServerClosed) {
 				err = nil
 			}
 		}
@@ -112,6 +113,7 @@ func run(args []string, out io.Writer) error {
 		return fmt.Errorf("unknown command %q", args[0])
 	}
 }
+
 func main() {
 	if err := run(os.Args[1:], os.Stdout); err != nil {
 		fmt.Fprintln(os.Stderr, err)

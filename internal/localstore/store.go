@@ -66,14 +66,14 @@ func Open(root string) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err = os.MkdirAll(abs, 0700); err != nil {
+	if err = os.MkdirAll(abs, 0o700); err != nil {
 		return nil, err
 	}
 	abs, err = filepath.EvalSymlinks(abs)
 	if err != nil {
 		return nil, err
 	}
-	f, err := os.OpenFile(filepath.Join(abs, ".localstore.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	f, err := os.OpenFile(filepath.Join(abs, ".localstore.lock"), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -83,6 +83,7 @@ func Open(root string) (*Store, error) {
 	}
 	return &Store{root: abs, lock: f}, nil
 }
+
 func (s *Store) Close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -105,6 +106,7 @@ func (s *Store) dir(id string) (string, error) {
 	}
 	return dir, nil
 }
+
 func decode(data []byte, v any) error {
 	d := json.NewDecoder(bytes.NewReader(data))
 	d.UseNumber()
@@ -116,6 +118,7 @@ func decode(data []byte, v any) error {
 	}
 	return nil
 }
+
 func readLimited(path string) ([]byte, error) {
 	st, e := os.Lstat(path)
 	if e != nil {
@@ -126,6 +129,7 @@ func readLimited(path string) ([]byte, error) {
 	}
 	return os.ReadFile(path)
 }
+
 func (s *Store) load(id string) (manifest, string, error) {
 	dir, e := s.dir(id)
 	if e != nil {
@@ -142,6 +146,7 @@ func (s *Store) load(id string) (manifest, string, error) {
 	e = decode(b, &m)
 	return m, dir, e
 }
+
 func cp(c commit) Checkpoint {
 	return Checkpoint{Sequence: c.Request.Sequence, TransactionID: c.Request.TransactionID, VersionID: c.Request.VersionID, Position: c.Request.ResumeAfter}
 }
@@ -154,6 +159,7 @@ func syncDir(dir string) error {
 	defer f.Close()
 	return f.Sync()
 }
+
 func atomicFile(dir, name string, data []byte) error {
 	if len(data) > maxFileSize {
 		return errors.New("store file exceeds 64 MiB limit")
@@ -219,7 +225,7 @@ func (s *Store) Commit(ctx context.Context, r CommitRequest) (Checkpoint, error)
 	if r.Sequence != uint64(len(m.Commits))+1 {
 		return Checkpoint{}, errors.New("SEQUENCE_GAP: transaction sequence must be contiguous")
 	}
-	if e = os.MkdirAll(dir, 0700); e != nil {
+	if e = os.MkdirAll(dir, 0o700); e != nil {
 		return Checkpoint{}, e
 	}
 	if e = syncDir(s.root); e != nil {
@@ -269,6 +275,7 @@ func (s *Store) Commit(ctx context.Context, r CommitRequest) (Checkpoint, error)
 	}
 	return cp(c), nil
 }
+
 func (s *Store) Checkpoint(id string) (Checkpoint, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -281,6 +288,7 @@ func (s *Store) Checkpoint(id string) (Checkpoint, bool, error) {
 	}
 	return cp(m.Commits[len(m.Commits)-1]), true, nil
 }
+
 func (s *Store) commits(id string) ([]CommitRequest, error) {
 	m, dir, e := s.load(id)
 	if e != nil {
@@ -306,7 +314,7 @@ func (s *Store) commits(id string) ([]CommitRequest, error) {
 			d.UseNumber()
 			for {
 				var v model.Envelope
-				if e = d.Decode(&v); e == io.EOF {
+				if e = d.Decode(&v); errors.Is(e, io.EOF) {
 					break
 				}
 				if e != nil {
@@ -319,6 +327,7 @@ func (s *Store) commits(id string) ([]CommitRequest, error) {
 	}
 	return out, nil
 }
+
 func (s *Store) Commits(id string) ([]CommitRequest, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

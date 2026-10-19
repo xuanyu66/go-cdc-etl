@@ -3,6 +3,7 @@ package pipeline
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 )
@@ -25,7 +26,7 @@ func DecodeJSON(data []byte) (Definition, error) {
 
 func scanValue(d *json.Decoder, depth int) error {
 	if depth > 64 {
-		return fmt.Errorf("definition nesting exceeds 64")
+		return errors.New("definition nesting exceeds 64")
 	}
 	token, err := d.Token()
 	if err != nil {
@@ -45,7 +46,7 @@ func scanValue(d *json.Decoder, depth int) error {
 			}
 			key, ok := token.(string)
 			if !ok {
-				return fmt.Errorf("object key must be string")
+				return errors.New("object key must be string")
 			}
 			if seen[key] {
 				return fmt.Errorf("duplicate JSON key %q", key)
@@ -62,7 +63,7 @@ func scanValue(d *json.Decoder, depth int) error {
 			}
 		}
 	default:
-		return fmt.Errorf("unexpected JSON delimiter")
+		return errors.New("unexpected JSON delimiter")
 	}
 	_, err = d.Token()
 	return err
@@ -71,7 +72,7 @@ func scanValue(d *json.Decoder, depth int) error {
 // ValidateJSON checks framing, duplicate keys and resource limits for API JSON.
 func ValidateJSON(data []byte) error {
 	if len(data) > 1<<20 {
-		return fmt.Errorf("definition exceeds 1 MiB")
+		return errors.New("definition exceeds 1 MiB")
 	}
 	scanner := json.NewDecoder(bytes.NewReader(data))
 	scanner.UseNumber()
@@ -79,7 +80,7 @@ func ValidateJSON(data []byte) error {
 		return err
 	}
 	if _, err := scanner.Token(); err != io.EOF {
-		return fmt.Errorf("expected exactly one JSON document")
+		return errors.New("expected exactly one JSON document")
 	}
 	return nil
 }

@@ -19,13 +19,16 @@ var (
 )
 
 // Scope is derived from authenticated ownership, not trusted request JSON.
-type Scope struct{ TenantID, InstanceID, Generation string }
-type Lease struct {
-	Scope     Scope
-	Owner     string
-	Fence     uint64
-	ExpiresAt time.Time
-}
+type (
+	Scope struct{ TenantID, InstanceID, Generation string }
+	Lease struct {
+		Scope     Scope
+		Owner     string
+		Fence     uint64
+		ExpiresAt time.Time
+	}
+)
+
 type Cursor struct {
 	Revision      uint64       `json:"revision,string"`
 	Sequence      uint64       `json:"sequence,string"`
