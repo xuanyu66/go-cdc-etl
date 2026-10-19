@@ -2571,10 +2571,14 @@
               "type": "object",
               "additionalProperties": true
             }
+          },
+          "checkpoint": {
+            "$ref": "#/components/schemas/Checkpoint"
           }
         },
         "required": [
-          "rows"
+          "rows",
+          "checkpoint"
         ]
       },
       "DraftPage": {

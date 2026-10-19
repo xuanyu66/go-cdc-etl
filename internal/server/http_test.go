@@ -7,7 +7,70 @@ import (
 	"net/http/httptest"
 	"os"
 	"testing"
+
+	"example.com/etl/internal/localstore"
+	"example.com/etl/internal/model"
+	"example.com/etl/pkg/pipeline"
 )
+
+func TestOutputIncludesSnapshotCheckpoint(t *testing.T) {
+	s, err := Open(context.Background(), Config{DataDir: t.TempDir(), WorkerExecutable: os.Args[0]})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close(context.Background())
+	raw, err := os.ReadFile("../../examples/pipeline.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d, err := pipeline.DecodeJSON(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := pipeline.Compile(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.data.Versions["version-1"] = Version{ID: "version-1", Plan: plan}
+	initial := model.Position{File: "mysql-bin.000001", Offset: 4}
+	s.data.Instances["instance-1"] = Instance{ID: "instance-1", VersionID: "version-1", InitialPosition: initial}
+	get := func() localstore.OutputSnapshot {
+		t.Helper()
+		w := httptest.NewRecorder()
+		s.ServeHTTP(w, httptest.NewRequest("GET", "/v1/instances/instance-1/outputs/orders", nil))
+		if w.Code != 200 {
+			t.Fatalf("output response: %d %s", w.Code, w.Body.String())
+		}
+		var snapshot localstore.OutputSnapshot
+		if err := json.Unmarshal(w.Body.Bytes(), &snapshot); err != nil {
+			t.Fatal(err)
+		}
+		return snapshot
+	}
+	before := get()
+	if before.Rows == nil || len(before.Rows) != 0 || before.Checkpoint.Sequence != 0 || before.Checkpoint.Position != initial || before.Checkpoint.VersionID != "version-1" {
+		t.Fatalf("initial output: %+v", before)
+	}
+	r := localstore.CommitRequest{InstanceID: "instance-1", Sequence: 1, TransactionID: "tx-1", VersionID: "version-1", ResumeAfter: model.Position{File: initial.File, Offset: 100}, Outputs: plan.Outputs()}
+	if _, err := s.store.Commit(context.Background(), r); err != nil {
+		t.Fatal(err)
+	}
+	empty := get()
+	if len(empty.Rows) != 0 || empty.Checkpoint.Sequence != 1 || empty.Checkpoint.Position != r.ResumeAfter {
+		t.Fatalf("filtered output lost progress: %+v", empty)
+	}
+	r.Sequence = 2
+	r.TransactionID = "tx-2"
+	r.ResumeAfter.Offset = 200
+	r.Records = []model.Envelope{{MutationID: "m-2", EventID: "e-2", Index: 0, Mutation: model.Mutation{Output: "orders", Operation: "upsert", Key: map[string]any{"order_id": "1"}, Value: map[string]any{"order_id": "1", "customer_id": "7", "total": "24"}}}}
+	if _, err := s.store.Commit(context.Background(), r); err != nil {
+		t.Fatal(err)
+	}
+	after := get()
+	if len(after.Rows) != 1 || after.Rows[0]["total"] != "24" || after.Checkpoint.Sequence != 2 || after.Checkpoint.TransactionID != "tx-2" || after.Checkpoint.Position != r.ResumeAfter {
+		t.Fatalf("committed output: %+v", after)
+	}
+}
 
 func TestDraftVersionsIdempotencyAndPersistence(t *testing.T) {
 	dir := t.TempDir()

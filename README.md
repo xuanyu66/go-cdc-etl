@@ -49,4 +49,4 @@ make e2e
 | `e2e` | Go integration 测试 |
 | `pkg` 其余包 | 早期扩展接口草案，尚未接入运行链路，不是额外已支持后端 |
 
-[总体设计](docs/design.md) 与 [调研](docs/research/) 保留后续架构讨论；本次已实现范围以 [用户文档](docs/user-guide.md) 和 OpenAPI 为准。
+[总体设计](docs/design.md) 与 [调研](docs/research/) 保留后续架构讨论；本次已实现范围以 [用户文档](docs/user-guide.md) 和 OpenAPI 为准。已知缺陷与后续规划见 [Roadmap](docs/roadmap.md)。
