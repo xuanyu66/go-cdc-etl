@@ -1,28 +1,28 @@
-# MySQL Listener 的扩缩容与内部 API
+# MySQL Listener Scaling and Internal API
 
-状态：调研与接口草案；核验日期：2026-10-19。本文不是生产实现，首版范围沿用 [项目设计](../design.md)。下文扩缩容策略与接口为本项目建议，引用资料只证明第三方能力。
+Status: research and interface draft; verification date: 2026-10-19. This document is not a production implementation; the first-version scope follows the [project design](../design.md). The scaling strategies and interfaces below are recommendations for this project; the cited references only prove third-party capabilities.
 
-## 1. 结论：可以弹性扩展，但要区分读取与执行
+## 1. Conclusion: Elastic Scaling Is Possible, but Reads and Execution Must Be Distinguished
 
-单一 MySQL 实例的一条 binlog 不天然提供 Kafka partition 一样的独立消费分区。首版采用每个 `pipeline instance + source` 一个 active reader，顺序解析事务；为同一 source 增加多个 reader 并按表过滤，通常会重复接收/扫描日志，不能宣称读取吞吐按副本数线性增长。
+A single MySQL instance's binlog does not natively provide independent consumption partitions like Kafka partitions. The first version uses one active reader per `pipeline instance + source`, parsing transactions in order; adding multiple readers for the same source with per-table filtering usually re-receives/re-scans the log, so read throughput cannot be claimed to scale linearly with replica count.
 
-MySQL 描述的复制链路是 dump thread、receiver 与后续 applier。多线程复制主要并行化应用阶段，不意味着多个 receiver 会自动分担同一条日志。[MySQL replication threads](https://dev.mysql.com/doc/refman/8.4/en/replication-threads.html)。Debezium 的 MySQL connector 也固定使用一个 task；这是一项成熟实现的边界参考，不是对所有自研读取算法的理论禁止。[Debezium MySQL connector](https://debezium.io/documentation/reference/stable/connectors/mysql.html#mysql-property-tasks-max)。
+MySQL describes its replication chain as dump thread, receiver, and subsequent applier. Multi-threaded replication mainly parallelizes the apply phase; it does not mean multiple receivers automatically share the load of one log. [MySQL replication threads](https://dev.mysql.com/doc/refman/8.4/en/replication-threads.html). Debezium's MySQL connector also pins to a single task; this is a boundary reference from a mature implementation, not a theoretical prohibition on all custom read algorithms. [Debezium MySQL connector](https://debezium.io/documentation/reference/stable/connectors/mysql.html#mysql-property-tasks-max).
 
-| 扩容层 | 扩容单位 | 能解决的问题 | 边界 |
+| Scaling layer | Scaling unit | Problems it can solve | Boundary |
 | --- | --- | --- | --- |
-| Reader worker 池 | 不同来源/管道的 reader assignment | 更多租户、MySQL 实例或物理分片 | 同一个 assignment 只能有一个有效所有者 |
-| 单 Reader | CPU、网络、解码与缓存优化 | 单源读取/解析瓶颈 | 不能无界扩内存；应单独压测单流上限 |
-| Transform worker 池 | 已形成的独立无状态调用 | 用户转换 CPU 成本与突发 | 首版每管道在途事务仍为 1；并发来自不同管道 |
-| Sink worker 池 | 独立对象上传任务 | 压缩/上传等待、跨管道并发 | 全部分支持久化后才能提交事务 |
-| 来源物理分片 | 独立 MySQL 日志 | 提升总体源吞吐 | 需要业务分片或来源拓扑变化，不是 ETL 自动切表即可实现 |
+| Reader worker pool | reader assignment for different sources/pipelines | more tenants, MySQL instances, or physical shards | one assignment can have only one valid owner |
+| Single reader | CPU, network, decoding, and cache optimization | single-source read/parse bottleneck | memory cannot grow unboundedly; benchmark the single-stream ceiling separately |
+| Transform worker pool | already-formed independent stateless calls | user-transform CPU cost and bursts | first version keeps one in-flight transaction per pipeline; concurrency comes from different pipelines |
+| Sink worker pool | independent object upload tasks | compression/upload wait, cross-pipeline concurrency | a transaction can be committed only after all branches persist |
+| Source physical sharding | independent MySQL logs | increase overall source throughput | requires business sharding or source-topology change; not achievable by the ETL tool splitting tables automatically |
 
-从多个副本各读一遍通常用于可用性或隔离源负载，不能据此声称切开了同一 binlog。切换副本还必须验证 GTID 覆盖、源逻辑身份、schema 历史与所需 binlog 的可用性。
+Reading the full log from multiple replicas is usually for availability or isolating source load; it cannot be claimed to split the same binlog. Switching replicas must also verify GTID coverage, source logical identity, schema history, and the availability of the required binlogs.
 
-首版不做跨租户共享 reader：同一数据库的多条管道可以各自读取，有明确连接/源压力配额。未来共享 reader 时，必须先引入可靠 fan-out 和每订阅者独立进度，否则慢订阅者和日志过期会相互影响。
+The first version does not share readers across tenants: multiple pipelines on the same database may each read, with explicit connection/source pressure quotas. Sharing readers in the future requires reliable fan-out and independent progress per subscriber first; otherwise slow subscribers and log expiry will interfere with each other.
 
-## 2. 第一版与后续扩展路径
+## 2. First Version and Follow-up Scaling Path
 
-### 第一版：保持事务顺序，先支持多来源弹性
+### First version: preserve transaction order, support multi-source elasticity first
 
 ```text
 Scheduler → Reader assignment + lease
@@ -38,66 +38,66 @@ Scheduler → Reader assignment + lease
                     fenced checkpoint
 ```
 
-每个管道只持有一个未提交事务，多个管道分配到 worker 池并行运行。已读事务可能因大小拆成多个转换批次，但提交单元仍是完整事务。该策略简单且与现有设计一致；代价是单条管道无法仅靠增加 executor 副本无限提速。单个大事务超预算时明确暂停，不为了扩容突破资源上限。
+Each pipeline holds only one uncommitted transaction; multiple pipelines are assigned to the worker pool and run in parallel. A read transaction may be split into multiple transform batches due to size, but the commit unit remains the complete transaction. This strategy is simple and consistent with the existing design; the cost is that a single pipeline cannot be accelerated indefinitely just by adding executor replicas. When a single large transaction exceeds the budget, it is explicitly paused; resource limits are not breached for the sake of scaling.
 
-### 后续：单 Reader + 有界并行执行
+### Follow-up: single reader + bounded parallel execution
 
-如果原型证实转换或 S3 是单管道瓶颈，可增加多个在途事务：
+If the prototype proves the transform or S3 is the single-pipeline bottleneck, multiple in-flight transactions can be added:
 
-1. Reader 顺序建立稳定事务身份、源位置与批次计划；批次计划先持久化。
-2. 无状态事务/批次允许并行执行；关联 DAG 全部分支的完成状态。
-3. Checkpoint coordinator 只推进**源顺序中连续完成的事务前缀**：`T1` 未完成时，即使 `T2`、`T3` 完成，也不能提交到 `T3`。
-4. 未完成窗口受事务数、字节数和最早事务年龄限制；慢事务达到窗口上限就停止继续分发，避免完成状态和输出无限增长。
+1. The reader establishes stable transaction identity, source position, and batch plans in order; batch plans are persisted first.
+2. Stateless transactions/batches may execute in parallel; completion status tracks all branches of the associated DAG.
+3. The checkpoint coordinator advances only the **continuously completed transaction prefix in source order**: when `T1` is incomplete, `T2` and `T3` cannot be committed up to `T3` even if they are complete.
+4. The incomplete window is bounded by transaction count, byte count, and the age of the oldest transaction; when a slow transaction hits the window limit, dispatch stops, preventing completion status and output from growing without bound.
 
-这里的顺序是已观察到的源事务顺序。GTID set 不是单调可比较的整数，不能用字符串排序或取“最大 GTID”实现前缀推进；必须维护源遍历顺序与对应恢复位置。
+The order here is the observed source transaction order. A GTID set is not a monotonically comparable integer; prefix advancement cannot be implemented by string sorting or taking the "maximum GTID"; the source traversal order and the corresponding recovery positions must be maintained.
 
-这种扩展保持完整事务 checkpoint，但不提供 S3 对象物理出现顺序。需要下游事务可见性时应使用 commit manifest 或湖表协议；不能把上传完成顺序当成提交顺序。
+This extension preserves complete-transaction checkpoints but does not provide the physical appearance order of S3 objects. When downstream transaction visibility is needed, use a commit manifest or a lake-table protocol; upload completion order must not be treated as commit order.
 
-### 分片和顺序
+### Sharding and ordering
 
-首版只有 `source_order`，不提供用户自定义 key 分区。后续若支持按主键分片，要显式规定保证范围：相同 key 有序、不同 key 无全局顺序。主键更新应映射旧 key 和新 key 的依赖；一个事务跨多个 key/分区时仍要合并确认。无主键表需要稳定键策略，否则不能承诺按业务记录有序。扩容后直接改变 `hash(key) % worker_count` 会改变路由，应使用稳定虚拟分区，并在分区排空后迁移所有权。
+The first version has only `source_order` and does not provide user-defined key partitioning. If partitioning by primary key is supported later, the guarantee scope must be stated explicitly: same key ordered, different keys with no global order. Primary-key updates should map dependencies of the old key and the new key; a transaction spanning multiple keys/partitions still requires merged acknowledgment. Tables without primary keys need a stable-key strategy; otherwise ordering by business record cannot be promised. Changing `hash(key) % worker_count` directly after scaling changes routing; stable virtual partitions should be used, and ownership migrated after partitions are drained.
 
-## 3. Lease、Fencing 与迁移
+## 3. Lease, Fencing, and Migration
 
-Assignment key 为 `(tenant_id, pipeline_id, instance_id, source_id)`；源代次与输出世代另作为持久身份，不混同于短期 worker lease。
+The assignment key is `(tenant_id, pipeline_id, instance_id, source_id)`; source generation and output generation are separate persistent identities and must not be conflated with short-term worker leases.
 
-- 元数据库以条件更新获取 assignment lease，返回严格递增的 `fencing_token`。续约和提交均匹配 owner 与 token，并检查数据库时间下的有效期。
-- 原型建议 lease TTL 30 秒、每 10 秒续约；失去续约能力时尽早停止拉取和取消执行。这些是故障注入前的起点，不是生产可用性承诺。
-- 所有 checkpoint 和事务完成写入都在元数据库事务中校验 fencing token；旧 worker 即使网络恢复也不能推进任何提交状态。
-- 进程内取消、唯一 `server_id` 和 Kubernetes leader election 都不能代替元数据写入时的 fencing。
-- S3 不自动理解数据库 token。旧 worker 可能留下完整或未完成的额外对象；对象需要 attempt 身份，已发布 manifest 或已提交元数据只能引用有效所有者确认的对象。
-- 正常缩容：标记 draining、停止获取新事务、完成当前事务并提交、关闭复制连接、释放 lease。超过排空期限则终止并由新 owner 从已提交 checkpoint 重放，允许重复，不能跳到读取位置。
-- Worker 崩溃：新 worker 等 lease 过期并获得新 token，读取持久 checkpoint，验证源连续性后恢复。未完成本地暂存丢弃。
+- The metadata database obtains the assignment lease by conditional update and returns a strictly increasing `fencing_token`. Renewal and commit both match the owner and token and check the validity period under database time.
+- For the prototype, a lease TTL of 30 seconds with renewal every 10 seconds is recommended; when renewal capability is lost, stop pulling and cancel execution as early as possible. These are starting points before fault injection, not production-availability promises.
+- All checkpoint and transaction-completion writes validate the fencing token inside a metadata database transaction; an old worker cannot advance any commit state even if its network recovers.
+- In-process cancellation, a unique `server_id`, and Kubernetes leader election cannot replace fencing at metadata-write time.
+- S3 does not automatically understand database tokens. An old worker may leave complete or incomplete extra objects; objects need attempt identity, and a published manifest or committed metadata may only reference objects confirmed by the valid owner.
+- Normal scale-in: mark draining, stop acquiring new transactions, finish and commit the current transaction, close the replication connection, and release the lease. If the drain deadline is exceeded, terminate and let the new owner replay from the committed checkpoint; duplicates are allowed, and the read position must not be skipped to.
+- Worker crash: a new worker waits for the lease to expire, acquires a new token, reads the persisted checkpoint, verifies source continuity, and resumes. Incomplete local staging is discarded.
 
-## 4. 背压、指标和扩缩容控制
+## 4. Backpressure, Metrics, and Scaling Control
 
-MySQL binlog 本身仍是首版重读来源，内存 channel、本地 spool 与复制库缓存都不作为可靠队列。对应用队列、库内部队列与本地暂存分别设字节上限；应用停止拉取后，库可能仍短暂读取，最终应通过有界缓冲和 TCP 对上游施加背压。Debezium 的有界阻塞队列是可参考的成熟背压机制。[Debezium queue 配置](https://debezium.io/documentation/reference/stable/connectors/mysql.html#mysql-property-max-queue-size)。
+The MySQL binlog itself remains the first-version re-read source; in-memory channels, local spools, and replication-library buffers are not treated as reliable queues. Set byte limits separately for the application queue, the library-internal queue, and local staging; after the application stops pulling, the library may still read briefly, and backpressure on the upstream should ultimately be applied through bounded buffering and TCP. Debezium's bounded blocking queue is a mature backpressure mechanism worth referencing. [Debezium queue configuration](https://debezium.io/documentation/reference/stable/connectors/mysql.html#mysql-property-max-queue-size).
 
-| 指标 | 用途 |
+| Metric | Purpose |
 | --- | --- |
-| input bytes/s、events/s、transactions/s | 区分大行、大事务与高事件数负载 |
-| reader CPU、解码耗时、网络吞吐、重连次数 | 定位读取侧瓶颈 |
-| waiting assignments、active assignments | 决定 reader 池是否需要更多承载容量 |
-| queue bytes / limit、spool bytes / limit | 实施背压和内存/磁盘保护 |
-| oldest uncommitted transaction age、checkpoint age | 识别实际交付落后与阻塞 |
-| read position 与 committed position | 区分读落后和下游落后；跨文件不得直接减位置 |
-| transform/sink queue age、latency、errors、throttles | 决定扩执行侧还是修复目标瓶颈 |
-| lease loss、fence reject、drain duration | 验证缩容与故障切换 |
-| oldest available binlog / required checkpoint | 判断实际重放缺口与保留风险 |
+| input bytes/s, events/s, transactions/s | distinguish large-row, large-transaction, and high-event-count loads |
+| reader CPU, decode latency, network throughput, reconnect count | locate read-side bottlenecks |
+| waiting assignments, active assignments | decide whether the reader pool needs more capacity |
+| queue bytes / limit, spool bytes / limit | enforce backpressure and memory/disk protection |
+| oldest uncommitted transaction age, checkpoint age | identify actual delivery lag and blocking |
+| read position vs committed position | distinguish read lag from downstream lag; positions must not be subtracted directly across files |
+| transform/sink queue age, latency, errors, throttles | decide whether to scale the execution side or fix the target bottleneck |
+| lease loss, fence reject, drain duration | verify scale-in and failover |
+| oldest available binlog / required checkpoint | judge the actual replay gap and retention risk |
 
-源事件时间只用于近似延迟，需要区分空闲来源与真实积压，并考虑源时钟偏差。不能只靠“最后一条事件时间距现在多久”把空闲数据库扩到上限。
+Source event time is only used for approximate lag; idle sources must be distinguished from real backlog, and source clock skew must be considered. An idle database must not be scaled to the maximum based solely on "how long ago the last event was".
 
-建议控制策略：
+Recommended control policy:
 
-1. Reader 池根据待分配来源、加权 assignment 负载和 CPU 扩容；若仅一个热 source 的读取侧饱和，标记 `SOURCE_READER_SATURATED`，不循环创建无用副本。
-2. Executor 池根据可调度 backlog 和服务时间估算并发，再受租户并发、最大副本和下游配额约束；S3 被节流时先退避，不持续加上传并发。
-3. 原型以 30 秒平滑窗口评估一次，连续两个窗口高负载才扩容；缩容观察 5 分钟低负载并逐个排空。具体阈值由基准确定，用户 API 不暴露未经验证的固定容量保证。
-4. Kubernetes 部署可将这些队列/assignment 指标提供给 `autoscaling/v2` HPA；HPA 自身支持自定义指标和稳定窗口，但它不负责 source 分配、事务排空与 fencing，这些仍由本服务实现。[Kubernetes HPA](https://kubernetes.io/docs/concepts/workloads/autoscaling/horizontal-pod-autoscale/)。
-5. Binlog 保留需覆盖最长故障和追赶窗口；配置的过期时间不是实际保留保证，还需检测手工清理等情况。恢复点已被清理就进入 `NEEDS_RESEED`，不切到 latest。[MySQL binlog 保留](https://dev.mysql.com/doc/refman/8.4/en/replication-options-binary-log.html#sysvar_binlog_expire_logs_seconds)。
+1. The reader pool scales based on pending assignments, weighted assignment load, and CPU; if only one hot source's read side is saturated, mark it `SOURCE_READER_SATURATED` instead of loop-creating useless replicas.
+2. The executor pool estimates concurrency from schedulable backlog and service time, then is constrained by tenant concurrency, maximum replicas, and downstream quotas; when S3 is throttled, back off first instead of continuously adding upload concurrency.
+3. The prototype evaluates once per 30-second smoothing window and scales out only after two consecutive high-load windows; scale-in observes 5 minutes of low load and drains one by one. Concrete thresholds are determined by benchmarks, and the user API must not expose unverified fixed-capacity guarantees.
+4. Kubernetes deployments can expose these queue/assignment metrics to the `autoscaling/v2` HPA; HPA itself supports custom metrics and stabilization windows, but it does not handle source assignment, transaction draining, or fencing — those remain this service's responsibility. [Kubernetes HPA](https://kubernetes.io/docs/concepts/workloads/autoscaling/horizontal-pod-autoscale/).
+5. Binlog retention must cover the longest failure and catch-up window; the configured expiry time is not an actual retention guarantee, and manual cleanup must also be detected. If the recovery point has been purged, enter `NEEDS_RESEED` instead of switching to latest. [MySQL binlog retention](https://dev.mysql.com/doc/refman/8.4/en/replication-options-binary-log.html#sysvar_binlog_expire_logs_seconds).
 
-## 5. Go 内部 API 草案
+## 5. Go Internal API Draft
 
-下列为职责说明，统一代码框架以项目 Go 类型为准。`CDCEvent` 使用主设计的无损类型；来源连接参数以凭证引用而非明文在外部 API 暴露。
+The following are responsibility descriptions; the unified code framework follows the project's Go types. `CDCEvent` uses the lossless types of the main design; source connection parameters are exposed in the external API as credential references, not plaintext.
 
 ```go
 type SourcePosition struct {
@@ -146,31 +146,31 @@ type LeaseStore interface {
 }
 ```
 
-契约：
+Contract:
 
-- `Next` 仅返回完整已提交事务；不订阅的行在标准化前过滤，但仍识别边界。ROLLBACK 不生成已提交业务事件；DDL 走安全暂停错误，不能伪装成普通事务。心跳/轮转由内部处理，可观测但不产生用户行记录。
-- 调用 `Next` 不写 checkpoint；不把复制协议 ACK 当作最终 S3 交付确认。Checkpoint coordinator 是唯一进度提交者。
-- 每个 stream 仅单 goroutine 调用 `Next`；`Close` 必须可与阻塞读取配合取消并幂等关闭。`Next` 的取消语义、连接中断后的重连策略在适配器中统一测试。
-- `Open` 失败需区分 `SOURCE_UNAVAILABLE`、`INVALID_POSITION`、`BINLOG_GAP`、`SCHEMA_REQUIRED` 与 `INVALID_CONFIGURATION`；运行期另有 `SCHEMA_CHANGED`、`TRANSACTION_TOO_LARGE` 和 `LEASE_LOST`。暂时性断网可重试，缺口和结构变化需要显式处理。
-- 事件身份不依赖 worker、token 和本次重试；重启后相同源事件生成相同 ID。`Lease.Token` 仅控制写入权限。
+- `Next` returns only complete committed transactions; unsubscribed rows are filtered before normalization but transaction boundaries are still recognized. ROLLBACK produces no committed business events; DDL takes the safe-pause error path and must not be disguised as an ordinary transaction. Heartbeats/rotations are handled internally; they are observable but produce no user row records.
+- Calling `Next` does not write checkpoints; replication-protocol ACKs must not be treated as final S3 delivery acknowledgments. The checkpoint coordinator is the sole progress committer.
+- Each stream may be called by only a single goroutine via `Next`; `Close` must be able to cancel in combination with blocked reads and must close idempotently. The cancellation semantics of `Next` and the reconnect policy after connection interruption are tested uniformly in the adapter.
+- `Open` failures must distinguish `SOURCE_UNAVAILABLE`, `INVALID_POSITION`, `BINLOG_GAP`, `SCHEMA_REQUIRED`, and `INVALID_CONFIGURATION`; at runtime there are additionally `SCHEMA_CHANGED`, `TRANSACTION_TOO_LARGE`, and `LEASE_LOST`. Transient network outages may be retried; gaps and schema changes require explicit handling.
+- Event identity must not depend on the worker, token, or the current retry; the same source event produces the same ID after a restart. `Lease.Token` only controls write permission.
 
-候选 Go 库的复制适配器以 `StartSync(mysql.Position)` / `StartSyncGTID(mysql.GTIDSet)` 打开，`BinlogStreamer.GetEvent(ctx)` 拉取事件，`BinlogSyncer.Close()` 关闭。库提供原始复制能力，事务组装、schema 历史、fencing 和 checkpoint 协调由本项目实现。已通过 `gh api` 查阅官方源码，正式接入仍需固定版本。[go-mysql replication API](https://pkg.go.dev/github.com/go-mysql-org/go-mysql/replication)。
+The candidate Go library's replication adapter opens with `StartSync(mysql.Position)` / `StartSyncGTID(mysql.GTIDSet)`, pulls events via `BinlogStreamer.GetEvent(ctx)`, and closes with `BinlogSyncer.Close()`. The library provides raw replication capability; transaction assembly, schema history, fencing, and checkpoint coordination are implemented by this project. The official source has been reviewed via `gh api`; a pinned version is still required for formal adoption. [go-mysql replication API](https://pkg.go.dev/github.com/go-mysql-org/go-mysql/replication).
 
-## 6. 验收与下一步
+## 6. Acceptance and Next Steps
 
-- 多来源扩容后 assignment 能分散；同一 assignment 不出现两个有效提交者。
-- 热单源读取饱和能正确诊断；增加空闲 reader 副本不被误报为吞吐提升。
-- 故障注入覆盖续约中断、旧 owner 恢复、新 owner 接管、缩容超时；旧 token 提交始终拒绝。
-- 下游停顿时全部队列/暂存有界；超大事务暂停；数据库仍能保留足够 binlog 时恢复无静默遗漏。
-- 对事务序列 `T1/T2/T3`，即使后续扩展允许乱序完成，`T1` 未完成时 checkpoint 不越过它。
-- 无输出、全部过滤及非订阅表事务能推进安全位置；DDL、轮转、重连和 binlog 缺口有明确状态。
-- GTID 主库切换与 file-position 恢复分开测试，不声称 file-position 可直接迁移到另一台服务器。
+- After multi-source scaling, assignments spread out; one assignment never has two valid committers.
+- A hot single-source read saturation is diagnosed correctly; adding idle reader replicas is not misreported as throughput improvement.
+- Fault injection covers renewal interruption, old-owner recovery, new-owner takeover, and scale-in timeout; commits with old tokens are always rejected.
+- When downstream stalls, all queues/staging stay bounded; oversized transactions pause; recovery has no silent omissions as long as the database retains enough binlogs.
+- For the transaction sequence `T1/T2/T3`, even if a later extension allows out-of-order completion, the checkpoint does not pass `T1` while it is incomplete.
+- Transactions with no output, fully filtered, or on unsubscribed tables can advance the safe position; DDL, rotation, reconnects, and binlog gaps have explicit states.
+- GTID primary-switch and file-position recovery are tested separately; do not claim file-position can be migrated directly to another server.
 
-建议先完成单 active reader 的恢复与 fencing 原型，再测单源瓶颈。只有数据证明转换或上传阻塞单管道时才引入有界并行和重排完成账本；需要更长故障缓冲时可采用下一节的 S3 durable buffer，而不是直接引入完整 Kafka 集群。
+It is recommended to finish the recovery and fencing prototype with a single active reader first, then test the single-source bottleneck. Introduce bounded parallelism and a reordered-completion ledger only when data proves the transform or upload blocks a single pipeline; when a longer failure buffer is needed, use the S3 durable buffer in the next section instead of introducing a full Kafka cluster directly.
 
-## 7. 下游积压时是否把 binlog 转存云存储
+## 7. Whether to Spill Binlogs to Cloud Storage Under Downstream Backlog
 
-可以，并且适合下游经常出现长时间积压、但希望尽快把数据从 MySQL 保留窗口内安全接走的场景。建议提供可选的 **S3 durable buffer**，归档已经解码和标准化的完整 CDC 事务及 schema 快照或不可变引用，而不是只上传裸 binlog 文件。裸 binlog 仍可作为额外备份，但恢复需要匹配的 schema、解码器、来源身份和事务边界，不适合作为执行器唯一输入协议。
+Yes, and it fits scenarios where downstream backlogs are often long but data must be moved out of the MySQL retention window quickly. An optional **S3 durable buffer** is recommended, archiving already decoded and normalized complete CDC transactions plus schema snapshots or immutable references, rather than uploading raw binlog files only. Raw binlogs may serve as an additional backup, but recovery requires matching schema, decoder, source identity, and transaction boundaries, so they are not suitable as the executor's only input protocol.
 
 ```text
 direct:
@@ -184,47 +184,47 @@ buffered:
                           execution → output S3 → delivered checkpoint
 ```
 
-### 7.1 两个水位不能混用
+### 7.1 The Two Watermarks Must Not Be Mixed
 
-| 水位 | 表示什么 | 谁推进 | 重启用途 |
+| Watermark | What it means | Who advances it | Restart use |
 | --- | --- | --- | --- |
-| archive ingestion watermark | 到此位置的完整事务已经可从归档连续恢复 | Archive publisher | Listener 可以从此继续读 MySQL |
-| delivered checkpoint | 到此位置的转换与所有必需输出已经持久化并提交 | Checkpoint coordinator | Executor 从此位置之后继续读 catalog |
+| archive ingestion watermark | complete transactions up to this position can be recovered continuously from the archive | Archive publisher | the Listener can continue reading MySQL from here |
+| delivered checkpoint | transforms and all required outputs up to this position have been persisted and committed | Checkpoint coordinator | the executor continues reading the catalog from after this position |
 
-归档成功只代表“接走了源数据”，绝不代表“用户输出已经完成”。Buffered 模式下 MySQL 故障恢复依赖前者，端到端交付状态依赖后者。告警分别呈现读取滞后、归档滞后和交付滞后。Direct 模式没有可靠归档水位，Listener 仍从 delivered checkpoint 恢复。
+A successful archive only means "the source data has been taken over", never "the user output is complete". In buffered mode, MySQL failure recovery depends on the former; end-to-end delivery status depends on the latter. Alerts present read lag, archive lag, and delivery lag separately. Direct mode has no reliable archive watermark; the Listener still recovers from the delivered checkpoint.
 
-### 7.2 归档对象和目录如何发布
+### 7.2 How Archive Objects and the Catalog Are Published
 
-归档 segment 可以包含多个完整事务，受压缩后/压缩前字节、事务数与最大封口时间限制；不能把未完整提交的事务宣布为已归档。事务过大时仍遵守显式大小限制，不能以对象存储容量大为理由无界缓存。
+An archive segment may contain multiple complete transactions, bounded by post-/pre-compression bytes, transaction count, and a maximum seal time; a transaction that is not fully committed must not be announced as archived. An oversized transaction still respects the explicit size limit; unbounded caching is not excused by object storage's large capacity.
 
-每个 segment 持有协议版本、来源及代次、稳定 segment ID、前驱 segment ID、起止恢复位置、事务索引、事件 ID、schema 摘要、压缩方式、长度与校验摘要。Schema 若单独存储，必须先可靠写入不可变 schema 对象，再发布引用；只记当前数据库表结构不足以重放历史事务。
+Each segment holds a protocol version, source and generation, stable segment ID, predecessor segment ID, start/end recovery positions, transaction index, event IDs, schema digest, compression method, length, and checksum digest. If schemas are stored separately, the immutable schema object must be written reliably first and then referenced; recording only the current database table structure is insufficient to replay historical transactions.
 
-发布顺序：
+Publication order:
 
-1. 以不可变对象键上传完整 segment，校验上传结果；可使用条件写入防止同名覆盖。归档凭证与用户输出凭证分开，用户函数无法读归档。
-2. 在 PostgreSQL 事务中校验 ingestion lease/fencing、预期旧 archive watermark 和前驱目录项，插入 segment catalog，再原子推进 archive watermark。任一条件不符则不发布该 segment。
-3. S3 对象与 PostgreSQL 不能跨系统原子提交；所谓“原子发布”指目录项和水位在 PostgreSQL 中一起提交，且只引用已确认存在的 S3 对象。上传后数据库提交前崩溃会留下孤儿对象，但不会产生已发布目录缺口。
-4. 发布失败重试按稳定 segment 身份与摘要核对；已有相同身份却内容不同则报错。旧 owner 可留下孤儿，但无权更新有效目录。
+1. Upload the complete segment under an immutable object key and verify the upload result; conditional writes may be used to prevent same-name overwrites. Archive credentials are separate from user-output credentials, and user functions cannot read the archive.
+2. In a PostgreSQL transaction, validate the ingestion lease/fencing, the expected old archive watermark, and the predecessor catalog entry; insert the segment catalog entry, then atomically advance the archive watermark. If any condition fails, the segment is not published.
+3. S3 objects and PostgreSQL cannot commit atomically across systems; the so-called "atomic publish" means the catalog entry and the watermark are committed together in PostgreSQL and only reference S3 objects confirmed to exist. A crash after upload but before database commit leaves orphan objects but produces no published-catalog gap.
+4. Retry of a failed publication checks against the stable segment identity and digest; an existing identity with different content is an error. An old owner may leave orphans but has no right to update the valid catalog.
 
-S3 支持对象级强一致读写，条件写入也能防止意外覆盖，但这些不提供 S3 与 PostgreSQL 之间的分布式事务。[S3 consistency model](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html#ConsistencyModel)、[S3 conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html)。目录竞争控制可采用行锁或条件更新，始终在同一数据库事务里维护前驱关系和水位。[PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html)。
+S3 supports object-level strongly consistent reads and writes, and conditional writes can prevent accidental overwrites, but these do not provide a distributed transaction between S3 and PostgreSQL. [S3 consistency model](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html#ConsistencyModel), [S3 conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html). Catalog contention control may use row locks or conditional updates; the predecessor relationship and the watermark are always maintained in the same database transaction. [PostgreSQL transaction isolation](https://www.postgresql.org/docs/current/transaction-iso.html).
 
-Executor 根据 PostgreSQL catalog 的前驱关系/已发布序号顺序取 segment，校验来源代次、事务索引和校验摘要，再从 delivered checkpoint 恢复。**禁止用 S3 LIST 排序拼接数据流**：即使 LIST 强一致，也无法辨别孤儿对象、旧 owner 尝试与已发布连续前缀；对象名排序也不能替代 GTID 语义。
+The executor takes segments in the order of the predecessor relationship/published sequence from the PostgreSQL catalog, validates the source generation, transaction index, and checksum digest, and then resumes from the delivered checkpoint. **Using S3 LIST to sort and concatenate the data stream is forbidden**: even if LIST is strongly consistent, it cannot distinguish orphan objects, old-owner attempts, and the published continuous prefix; object-name sorting cannot replace GTID semantics either.
 
-### 7.3 持续 buffered 优于临时溢写
+### 7.3 Continuous Buffered Mode Beats Temporary Spillover
 
-推荐在管道启动时明确选择 `direct` 或 `buffered`。Buffered 始终先归档再执行，这样路径和恢复规则固定；不在队列超过阈值时临时把后半段切到 S3，又在恢复后直接追实时数据。这种自动溢写需要额外保证切换边界、在途数据和归档流之间没有洞、重复或超越，收益通常不足以抵消复杂度。
+It is recommended to choose `direct` or `buffered` explicitly at pipeline startup. Buffered mode always archives before executing, keeping the path and recovery rules fixed; it does not temporarily spill the second half to S3 when a queue exceeds a threshold and then chase live data directly after recovery. Such automatic spillover requires extra guarantees that there are no holes, duplicates, or overruns between the switch boundary, in-flight data, and the archive stream; the benefit is usually not worth the complexity.
 
-模式切换仅允许显式暂停、排空并记录完整事务边界后完成；第一版可以直接拒绝运行中切换。此轮只增加 durable buffer 的职责、接口边界与文档，不实现归档/重放后端；direct 仍为现有首版参考路径。
+Mode switching is allowed only after an explicit pause, drain, and recording of the complete-transaction boundary; the first version may simply reject in-flight switching. This round only adds the durable buffer's responsibilities, interface boundaries, and documentation; the archive/replay backend is not implemented; `direct` remains the existing first-version reference path.
 
-### 7.4 清理、额度和成本
+### 7.4 Cleanup, Quotas, and Cost
 
-- 清理依据所有有效订阅者 delivered checkpoint 的最小连续位置，同时满足最短回放保留期；不能按 archive watermark 删除尚未交付的数据。
-- 初期每管道独立归档；未来共享来源归档时，订阅者注册、退出和最慢进度必须纳入 GC 协议。单独故障订阅者达到额度只能暂停、告警或由用户显式放弃历史，不能静默跳过。
-- GC 在元数据库先标记候选并与新订阅/回放 pin 协调，再删除对象并记录结果；schema 在无任何活跃 segment/回放引用后才回收。孤儿对象需经过恢复安全期并核对目录，不能立即删新上传对象。
-- 设置每租户 buffer 字节、segment 数量、最长交付滞后和费用预算告警。达到硬额度时暂停 ingestion，依靠 MySQL 剩余保留期报警；如果所需日志已过期，进入 `NEEDS_RESEED`。
-- Lifecycle 不能无条件按固定天数删除未交付 buffer；应由目录 GC 控制业务可删除性。归档本身还需备份目录、保护 schema 与数据对象；只备份 S3 数据而丢失 catalog 不等于可恢复。
-- 成本包括额外 S3 PUT/GET/存储、PostgreSQL catalog、压缩与加解密、网络以及重放计算。较大 segment 降低请求成本但增加封口延迟、重放读放大与单次重试代价；小事务不宜默认每事务一个对象。单价按部署区域核算。[S3 pricing](https://aws.amazon.com/s3/pricing/)。
+- Cleanup is based on the minimum continuous position across the delivered checkpoints of all valid subscribers, subject to a minimum replay retention period; data not yet delivered must not be deleted by the archive watermark.
+- Initially each pipeline archives independently; when source archives are shared in the future, subscriber registration, deregistration, and the slowest progress must be incorporated into the GC protocol. A subscriber that is individually broken may only be paused, alerted, or have its history explicitly abandoned by the user; silently skipping is not allowed.
+- GC first marks candidates in the metadata database and coordinates with new-subscription/replay pins, then deletes objects and records the result; schemas are reclaimed only after no active segment/replay references remain. Orphan objects must pass a recovery safety period and be checked against the catalog; newly uploaded objects must not be deleted immediately.
+- Set per-tenant alerts for buffer bytes, segment count, maximum delivery lag, and cost budget. When a hard quota is reached, pause ingestion and rely on alarms about the MySQL remaining retention period; if the required logs have expired, enter `NEEDS_RESEED`.
+- Lifecycle rules must not unconditionally delete undelivered buffers by a fixed number of days; business deletability should be controlled by catalog GC. The archive itself also requires backing up the catalog and protecting schema and data objects; backing up only S3 data while losing the catalog is not recoverable.
+- Costs include extra S3 PUT/GET/storage, the PostgreSQL catalog, compression and encryption/decryption, network, and replay compute. Larger segments reduce request costs but increase seal latency, replay read amplification, and per-retry cost; small transactions should not default to one object per transaction. Unit prices are accounted by deployment region. [S3 pricing](https://aws.amazon.com/s3/pricing/).
 
-Durable buffer 解决的是源读取与下游执行的时间解耦，既不能突破单源 reader 吞吐，也不能使长期低于输入速率的执行器自动追上。积压持续增长时仍要扩 executor、提高转换效率、控制租户输入或扩容目标存储。
+The durable buffer solves time decoupling between source reading and downstream execution; it neither breaks through single-source reader throughput nor lets an executor running persistently below the input rate catch up automatically. When backlog keeps growing, the executor still must be scaled, transform efficiency improved, tenant input controlled, or target storage scaled up.
 
-补充验收包括上传后 catalog 提交前崩溃、catalog 提交结果未知、旧 ingestion token 发布、对象缺失/摘要错误、schema 丢失、最慢订阅者阻止 GC、达到额度停止归档，以及从归档重放后 delivered checkpoint 正确前进。
+Supplementary acceptance covers: crash after upload but before catalog commit, unknown catalog-commit result, publication with an old ingestion token, missing objects/digest errors, lost schema, slowest subscriber blocking GC, archiving stopped at quota, and the delivered checkpoint advancing correctly after replay from the archive.

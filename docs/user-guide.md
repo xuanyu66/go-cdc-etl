@@ -1,28 +1,28 @@
-# 本地 CDC + Lua MVP 用户文档
+# Local CDC + Lua MVP User Guide
 
-本文描述本次**实际实现**，不是未来产品承诺。API 版本为 `v1`；源为真实 MySQL，目标为本地 JSONL/manifest，Lua 使用 GopherLua 的 Lua 5.1 语言模型。
+This document describes the **actual implementation** of this release, not a future product commitment. The API version is `v1`; the source is real MySQL, the sink is local JSONL/manifest, and Lua uses GopherLua's Lua 5.1 language model.
 
-## 1. 本次功能范围
+## 1. Scope of This Release
 
-| 能力 | 本次支持与限制 |
+| Capability | Support and limits in this release |
 | --- | --- |
-| 来源 | 一个预配置的 `mysql-local` 连接；每条管道显式订阅 1–16 张 InnoDB 固定表 |
-| binlog | 必须开启 binlog，`ROW` + `FULL`；仅普通提交事务，file/position 恢复，不支持 GTID 切主 |
-| 初始数据 | 只做增量；创建实例时捕获当前位置，不扫描已有数据 |
-| 管道图 | 恰好一个 MySQL source → 一个 Lua transform → 1–16 个 local sink；不接受任意串联、Join、环路 |
-| 用户逻辑 | Lua 条件、循环、函数、字符串处理、同事件计算；可过滤、一对多、分流到已声明输出 |
-| 输出模型 | `upsert` / `delete`，显式业务键和固定 schema；一次返回多个变更按数组顺序应用 |
-| 存储 | 本地未压缩 JSONL 变更文件及原子 manifest；HTTP 提供按键物化的当前结果 |
-| 可靠性 | 全部逻辑输出及 checkpoint 同一次 manifest 提交；相同事务相同内容重复写不产生重复数据文件 |
-| 生命周期 | 不可变函数、可编辑草稿、不可变版本、每 pipeline 一个不可变版本实例；pause/resume、同目录服务重启恢复 |
-| DDL | 订阅表/schema 的 DDL 暂停；可安全解析的无关表/库 DDL 作为零输出操作推进；未知语句仍暂停 |
-| 未实现 | Iceberg/Parquet/S3、云端积压归档、初始全量、历史重算、GTID failover、自动 schema 演进、窗口状态、外部 API、分布式/多租户与自动扩缩容 |
+| Source | One preconfigured `mysql-local` connection; each pipeline explicitly subscribes to 1–16 fixed InnoDB tables |
+| Binlog | Binlog must be enabled with `ROW` + `FULL`; normal committed transactions only, file/position recovery, no GTID failover |
+| Initial data | Incremental only; the current position is captured at instance creation, and existing data is not scanned |
+| Pipeline graph | Exactly one MySQL source → one Lua transform → 1–16 local sinks; arbitrary chaining, joins, and cycles are not accepted |
+| User logic | Lua conditions, loops, functions, string handling, and same-event computation; can filter, fan out one-to-many, and route to declared outputs |
+| Output model | `upsert` / `delete` with explicit business keys and a fixed schema; multiple changes returned in one call are applied in array order |
+| Storage | Local uncompressed JSONL change files and an atomic manifest; HTTP serves key-materialized current results |
+| Reliability | All logical outputs and the checkpoint are committed in a single manifest; rewriting identical content for the identical transaction does not create duplicate data files |
+| Lifecycle | Immutable functions, editable drafts, immutable versions, one immutable-version instance per pipeline; pause/resume, and recovery on service restart in the same data directory |
+| DDL | DDL on subscribed tables/schemas pauses; unrelated table/database DDL that can be parsed safely advances as a zero-output operation; unknown statements still pause |
+| Not implemented | Iceberg/Parquet/S3, cloud backlog archival, initial full load, historical recomputation, GTID failover, automatic schema evolution, window state, external APIs, distributed/multi-tenant operation, and auto-scaling |
 
-本地服务只允许数值 loopback 地址监听，没有账号认证、生产级租户隔离和硬内存沙箱。Lua 子进程不继承平台凭证，库能力受限且有执行超时，但这**不构成运行外部不可信代码的生产安全边界**。不要通过代理把服务暴露到公网或共享网络。数据目录应为当前用户独占，不能由其他用户或程序修改。
+The local service only listens on numeric loopback addresses and has no account authentication, production-grade tenant isolation, or a hard memory sandbox. The Lua subprocess does not inherit platform credentials, has restricted library capability, and has an execution timeout, but this **does not constitute a production security boundary for running untrusted external code**. Do not expose the service to the public internet or shared networks through a proxy. The data directory should be owned exclusively by the current user and must not be modified by other users or programs.
 
-## 2. 启动真实 MySQL 和服务
+## 2. Starting Real MySQL and the Service
 
-依赖：Go 1.26+、Docker Desktop/Engine、Docker Compose、curl、Python 3；支持 macOS/Linux（本地文件锁使用 flock）。
+Dependencies: Go 1.26+, Docker Desktop/Engine, Docker Compose, curl, Python 3; macOS/Linux supported (local file locking uses flock).
 
 ```bash
 make mysql-up
@@ -34,9 +34,9 @@ ETL_MYSQL_PASSWORD=etl-demo-password ./bin/etl serve \
   -mysql-user etl
 ```
 
-Compose 创建独立 MySQL 8.4 容器、`shop.orders` 表，以及只允许 SELECT/复制的 `etl` 账号。MySQL 绑定本机 13306，root 演示口令是 `etl-demo-root`，复制账号口令是 `etl-demo-password`。凭证是本地开发配置，不写入 Pipeline 或 Lua。
+Compose creates a dedicated MySQL 8.4 container, the `shop.orders` table, and an `etl` account with SELECT/replication privileges only. MySQL binds to local port 13306; the root demo password is `etl-demo-root` and the replication account password is `etl-demo-password`. Credentials are local development configuration and are never written into the Pipeline or Lua.
 
-通过服务查询运行能力以及来源检查：
+Query the running capabilities and the source through the service:
 
 ```bash
 curl -sS http://127.0.0.1:8080/healthz
@@ -44,35 +44,35 @@ curl -sS http://127.0.0.1:8080/v1/capabilities
 curl -sS 'http://127.0.0.1:8080/v1/connections/mysql-local/inspect?tables=shop.orders'
 ```
 
-源列当前支持整数、DECIMAL、UTF-8/ASCII 字符串、binary/blob、JSON、date/time/datetime/timestamp/year；拒绝 FLOAT/DOUBLE、BIT、ENUM/SET、空间类型、生成列、不可见列及其他字符集，避免隐式损坏。目标 float64 类型可由 Lua 计算产生，不表示来源浮点列已支持。
+Source columns currently support integers, DECIMAL, UTF-8/ASCII strings, binary/blob, JSON, and date/time/datetime/timestamp/year; FLOAT/DOUBLE, BIT, ENUM/SET, spatial types, generated columns, invisible columns, and other character sets are rejected to avoid implicit corruption. The target `float64` type may be produced by Lua computation; this does not mean source floating-point columns are supported.
 
-inspect 返回当前 file/position、server UUID 和列信息，同时检查 ROW/FULL、InnoDB、列类型。它不是创建消费任务，也不会推进 checkpoint。连接只在服务参数中配置；MVP 没有连接管理或密钥管理 API。
+inspect returns the current file/position, the server UUID, and column information, and also checks ROW/FULL, InnoDB, and column types. It does not create a consumption task and does not advance the checkpoint. Connections are only configured via service flags; the MVP has no connection management or secret management API.
 
-## 3. 函数、草稿、版本与实例
+## 3. Functions, Drafts, Versions, and Instances
 
-- **Function**：Lua 源码的不可变资源；内容变化需要注册新函数，旧函数不会被覆盖。
-- **Pipeline Draft**：可修改的图定义，使用 revision 和 ETag 处理并发编辑。
-- **Pipeline Version**：发布草稿的固定快照，含函数引用、输出 schema 和图配置。
-- **Instance**：持续消费的运行实例，固定一个版本、源身份、schema 基线和首次起点。重启不创建新实例、不重置进度。
+- **Function**: an immutable resource of Lua source code; any content change requires registering a new function, and existing functions are never overwritten.
+- **Pipeline Draft**: an editable graph definition that uses revision and ETag to handle concurrent edits.
+- **Pipeline Version**: a fixed snapshot of a published draft, containing function references, output schema, and graph configuration.
+- **Instance**: a continuously consuming runtime instance pinned to one version, source identity, schema baseline, and initial starting position. Restarting does not create a new instance or reset progress.
 
-MVP 每 pipeline 只创建一个实例，不支持停止删除或在线升级。修改草稿、发布新版本不会更新旧实例。代码/schema 修复和保留原消费位置的新版本切换尚未提供；遇到此类错误先保留数据目录和 binlog，不通过重建实例伪装无损恢复。新 pipeline 从当前起点开始会遗漏之前未处理的历史，必须明确接受该边界。
+The MVP creates only one instance per pipeline and does not support stop-and-delete or online upgrade. Editing a draft or publishing a new version does not update existing instances. Switching to a new version that fixes code/schema while preserving the original consumption position is not yet provided; when you hit such an error, preserve the data directory and binlogs first, and do not fake lossless recovery by recreating the instance. A new pipeline that starts from the current position will miss previously unprocessed history; you must explicitly accept this boundary.
 
-## 4. 端到端快速体验
+## 4. End-to-end Quickstart
 
-创建函数、草稿、发布版本并启动实例：
+Create the function, the draft, publish a version, and start an instance:
 
 ```bash
 ./scripts/demo.sh
 ```
 
-脚本读取 `examples/order-transform.lua` 与 `examples/pipeline.json`，替换函数引用；请求及响应保存在 `.local/demo/`，实例响应包含 `instance_id`。
+The script reads `examples/order-transform.lua` and `examples/pipeline.json` and replaces the function reference; requests and responses are saved under `.local/demo/`, and the instance response contains `instance_id`.
 
 ```bash
 INSTANCE_ID=$(python3 -c 'import json; print(json.load(open(".local/demo/instance.json"))["instance_id"])')
 curl -sS "http://127.0.0.1:8080/v1/instances/$INSTANCE_ID"
 ```
 
-等待实际状态 `RUNNING`（仅代表 worker 已启动；最终成功以 checkpoint 和输出为准），向专用容器写入真实事务：
+Wait until the actual status is `RUNNING` (this only means the worker has started; final success is determined by the checkpoint and outputs), then write real transactions to the dedicated container:
 
 ```bash
 docker compose exec -T mysql mysql -uroot -petl-demo-root -e \
@@ -80,7 +80,7 @@ docker compose exec -T mysql mysql -uroot -petl-demo-root -e \
 curl -sS "http://127.0.0.1:8080/v1/instances/$INSTANCE_ID/outputs/orders"
 ```
 
-异步处理完成后，结果包含（checkpoint 的 ID 和位点为示意值）：
+After asynchronous processing completes, the result contains (the checkpoint ID and position are illustrative):
 
 ```json
 {
@@ -94,7 +94,7 @@ curl -sS "http://127.0.0.1:8080/v1/instances/$INSTANCE_ID/outputs/orders"
 }
 ```
 
-示例只输出 paid 订单，金额通过精确小数乘以 2。然后分别验证更新和删除（每条执行后轮询输出）：
+The example only outputs paid orders, with the amount multiplied by 2 using exact decimal. Then verify updates and deletes respectively (poll the output after each statement):
 
 ```bash
 docker compose exec -T mysql mysql -uroot -petl-demo-root -e \
@@ -103,13 +103,13 @@ docker compose exec -T mysql mysql -uroot -petl-demo-root -e \
   "DELETE FROM shop.orders WHERE id=1001;"
 ```
 
-更新后的 total 为字符串 `"31.1"`，删除后该业务键消失。精确小数 SDK 返回规范化字符串，不保证末尾补零；`31.1` 与 decimal(18,2) 兼容。
+After the update, `total` is the string `"31.1"`, and after the delete that business key disappears. The exact decimal SDK returns normalized strings and does not guarantee trailing zero padding; `31.1` is compatible with decimal(18,2).
 
-脚本幂等键固定，重新执行相同脚本返回原资源，不创建第二个任务，也不自动恢复暂停的实例。不要修改请求内容后复用旧 key。演示 ID 已存在时可改用其他 SQL 主键，不要为了演示自动清空数据。
+The script's idempotency keys are fixed; re-running the same script returns the original resources, does not create a second task, and does not automatically resume paused instances. Do not modify the request content and reuse an old key. When a demo ID already exists, use a different SQL primary key instead; do not wipe data automatically for the demo.
 
-## 5. Pipeline 定义
+## 5. Pipeline Definition
 
-完整样例为 `examples/pipeline.json`，结构如下：
+The complete example is `examples/pipeline.json`; the structure is as follows:
 
 ```json
 {
@@ -138,21 +138,21 @@ docker compose exec -T mysql mysql -uroot -petl-demo-root -e \
 }
 ```
 
-- `start.mode=current` 只在创建实例时解析一次。暂停/重启均恢复已提交位置，不能切到 latest。
-- 节点、字段和逻辑 output 名以小写字母开始，最多 63 字符，允许数字、`_` 和 `-`。固定表为简单 `database.table` 标识，不支持转义名称、通配符和动态新增。
-- 每个 sink 的 `output` 唯一；Lua 只可向这些名称输出，不可选择任意文件路径或创建表。
-- 所有 sink 均为必需分支。即使某输出本事务无变更，也会写显式空输出并参与统一提交。
-- `timeout_ms` 为 1–5000，每个调用批次受该期限约束；Lua 模块另有 2 秒执行上限，实际较小者生效。不是每条事件可独占全部时间。
-- `key_fields` 必须是 schema 中 required 的非浮点字段；业务键改变时由 Lua 产生旧键 delete 和新键 upsert。
-- fields 只支持 `string`、`bool`、`int64`、`uint64`、`float64`、`decimal(p,s)`（p≤38，0≤s≤p）。未知字段、类型错误和不完整 required 字段会使事务失败。可选字段允许缺失或 null；upsert 是整行替换，未提供可选字段不会保留旧值。
+- `start.mode=current` is resolved only once, at instance creation. Pause/restart both resume from the committed position; you cannot switch to latest.
+- Node, field, and logical output names start with a lowercase letter, are at most 63 characters, and may contain digits, `_`, and `-`. Fixed tables are simple `database.table` identifiers; escaped names, wildcards, and dynamic additions are not supported.
+- Each sink's `output` name is unique; Lua may only write to these names and cannot pick arbitrary file paths or create tables.
+- All sinks are mandatory branches. Even if an output has no changes in a given transaction, an explicit empty output is still written and participates in the unified commit.
+- `timeout_ms` is 1–5000 and constrains each invocation batch; the Lua module additionally has a 2-second execution cap, and the smaller of the two takes effect. A single event does not get to monopolize all of the time.
+- `key_fields` must be required, non-floating-point fields in the schema; when a business key changes, Lua must emit an old-key delete and a new-key upsert.
+- `fields` supports only `string`, `bool`, `int64`, `uint64`, `float64`, and `decimal(p,s)` (p≤38, 0≤s≤p). Unknown fields, type errors, and incomplete required fields fail the transaction. Optional fields may be missing or null; upsert replaces the whole row, and omitted optional fields do not retain old values.
 
-CLI 可校验图：`./bin/etl validate -file .local/demo/pipeline.json`。CLI 只做结构和图校验，不检查函数存在或建立数据库连接；HTTP validate 还检查函数引用。API 只接受 JSON；未实现一般 YAML 解析器。JSON Schema 用于编辑器和客户端，服务使用同一语义的 Go 校验器，不执行任意远程 schema 引用。
+The CLI can validate the graph: `./bin/etl validate -file .local/demo/pipeline.json`. The CLI performs only structural and graph validation; it does not check function existence or establish a database connection; HTTP validate additionally checks function references. The API accepts JSON only; a general YAML parser is not implemented. The JSON Schema is for editors and clients; the service uses a Go validator with the same semantics and does not fetch arbitrary remote schema references.
 
-## 6. Lua 编程协议
+## 6. Lua Programming Protocol
 
-### 输入
+### Input
 
-`function transform(event)` 接收一条完整 CDC 行变更。每事件新建 VM，因此全局变量无法跨事件积累状态。
+`function transform(event)` receives one complete CDC row change. A new VM is created per event, so global variables cannot accumulate state across events.
 
 ```json
 {
@@ -170,75 +170,75 @@ CLI 可校验图：`./bin/etl validate -file .local/demo/pipeline.json`。CLI �
 }
 ```
 
-columns 实际包含整张表的列。insert 的 before、delete 的 after 为 `etl.null`，行内 SQL NULL 也使用该哨兵，不是 Lua nil。`etl.null` 在 Lua 条件中为真，不能用 `event.after or event.before` 选择镜像，应按 `event.op` 显式分支；判断字段空值用 `field == etl.null`。`event_id` 与 binlog 位置绑定，同一源重放保持稳定；不承诺跨源重建或 binlog reset 仍可复用。
+`columns` actually contains all columns of the table. For an insert, `before`, and for a delete, `after`, are `etl.null`; an in-row SQL NULL also uses this sentinel and is not Lua nil. `etl.null` is truthy in Lua conditions, so you cannot pick a mirror via `event.after or event.before` — branch explicitly on `event.op` instead; test for a null field with `field == etl.null`. `event_id` is bound to the binlog position and stays stable when the same source replays; reuse across source rebuilds or after a binlog reset is not guaranteed.
 
-整数/DECIMAL 作为字符串传入，避免 Lua number 丢失大整数精度。二进制为 Base64；MySQL JSON 为原始 JSON 文本字符串，不自动变成 table；时间为源语义字符串，TIMESTAMP 按 UTC，DATETIME 不添加时区。当前没有内置 JSON 解码 SDK。详情可查 inspect 返回的源列类型。
+Integers/DECIMAL are passed as strings to avoid Lua numbers losing precision for large integers. Binary is Base64; MySQL JSON is the raw JSON text string and is not automatically converted into a table; times are source-semantic strings, with TIMESTAMP in UTC and DATETIME carrying no added timezone. There is no built-in JSON decoding SDK yet. See the source column types returned by inspect for details.
 
-### 输出
+### Output
 
-返回连续 Lua 数组，每项是：
+Return a contiguous Lua array, each item being:
 
 ```lua
 {output="orders", op="upsert", key={order_id="1001"},
  value={order_id="1001", customer_id="7", total="24.68"}}
 ```
 
-或删除：
+or a delete:
 
 ```lua
 {output="orders", op="delete", key={order_id="1001"}}
 ```
 
-`return {}` 表示过滤；`return nil`、稀疏数组、混合数组、循环引用、非有限数和函数值等均报错。delete 必须省略 value，upsert 必须包含完整 value；key 必须精确包含 key_fields，并与 value 对应字段一致。输出 op 不必与源 op 相同。
+`return {}` means filter out; `return nil`, sparse arrays, mixed arrays, circular references, non-finite numbers, and function values are all errors. A delete must omit `value`; an upsert must include the complete `value`; `key` must contain exactly the `key_fields` and match the corresponding fields in `value`. The output op does not have to match the source op.
 
-一对多通过返回多个 mutation；多输出通过不同 output 名路由。稳定子键、旧子项删除、状态过滤退出后的撤回，均由用户根据 before/after 实现。可参考 `examples/order-transform.lua` 的 paid→cancelled 删除和主键变更处理。平台不会自动从返回空数组推断应删除旧数据。
+One-to-many is done by returning multiple mutations; multiple outputs are routed by different output names. Stable child keys, deleting old child items, and retracting emitted data after a state-filter exit are all implemented by the user based on before/after. See the paid→cancelled delete and primary-key-change handling in `examples/order-transform.lua`. The platform does not automatically infer from an empty returned array that old data should be deleted.
 
-平台给每条 mutation 增加 `mutation_id`、`source_event_id`、`output_index`。用户不要自行填写这些字段。用户函数需对同一输入返回相同顺序和内容；遍历对象的 `pairs` 顺序不作为稳定协议，生成数组前应显式排序；重放内容冲突会停止，不能覆盖已经写出的不同内容。
+The platform adds `mutation_id`, `source_event_id`, and `output_index` to each mutation; do not set these fields yourself. User functions must return the same order and content for the same input; `pairs` iteration order over objects is not a stable protocol — sort explicitly before generating arrays; replay content conflicts stop the pipeline and cannot overwrite already-written different content.
 
-### SDK 与限制
+### SDK and Limits
 
-可用基础函数白名单、string/table/math（无 random/randomseed），以及：
+The available whitelist covers basic functions plus string/table/math (without random/randomseed), and:
 
-| API | 行为 |
+| API | Behavior |
 | --- | --- |
-| `etl.null` | JSON/SQL null 哨兵，保留对象中的空值 |
-| `etl.decimal_add(a,b)` | 两个十进制字符串精确相加，返回字符串 |
-| `etl.decimal_mul(a,b)` | 两个十进制字符串精确相乘，返回字符串 |
+| `etl.null` | JSON/SQL null sentinel, preserves null values in objects |
+| `etl.decimal_add(a,b)` | Exactly adds two decimal strings, returns a string |
+| `etl.decimal_mul(a,b)` | Exactly multiplies two decimal strings, returns a string |
 
-小数操作数最多 128 字节，只接受普通十进制格式。金额和业务 ID 不应使用 `tonumber`。没有 os/io/package/debug/print/dofile/loadfile/loadstring、网络或外部访问。函数注册仅编译、初始化并验证 transform 入口；真实输入、输出 schema 在运行时验证。
+Decimal operands are at most 128 bytes and only plain decimal format is accepted. Do not use `tonumber` for amounts and business IDs. There is no os/io/package/debug/print/dofile/loadfile/loadstring, and no network or external access. Function registration only compiles, initializes, and validates the transform entry; real input and output schema are validated at runtime.
 
-源码上限 64 KiB，worker 输入 1 MiB、输出 4 MiB。执行器按最多 100 事件及约 900 KB 输入拆批；单事件无法放入时暂停。一个事务的全部批次成功后才提交。子进程没有继承 MySQL 密码，超时被终止；尚无可靠硬内存限制，不接收恶意代码。
+The source code limit is 64 KiB; worker input is 1 MiB and output 4 MiB. The executor splits batches by at most 100 events and roughly 900 KB of input; a single event that cannot fit pauses the instance. A transaction is committed only after all its batches succeed. The subprocess does not inherit the MySQL password and is killed on timeout; there is no reliable hard memory limit yet — do not accept malicious code.
 
 ## 7. HTTP API
 
-成功响应为 `application/json`，错误为 RFC 9457 风格 `application/problem+json`。写请求必须 `Content-Type: application/json`；请求上限 1 MiB，拒绝未知字段、重复 JSON key 和多文档。浏览器带 Origin 的写请求拒绝，MVP 使用 curl/SDK。
+Successful responses are `application/json`; errors are RFC 9457-style `application/problem+json`. Write requests must have `Content-Type: application/json`; the request limit is 1 MiB, and unknown fields, duplicate JSON keys, and multi-document payloads are rejected. Browser write requests carrying an Origin header are rejected; the MVP targets curl/SDK usage.
 
-除 validate 外，所有写请求要求 `Idempotency-Key`（1–128 字符）。按方法、路径、key 保存原请求及响应：相同 body 和 If-Match 重试返回原结果，不重新执行；不同 body 或 precondition 复用 key 返回 409。记录持久化在本地 catalog，MVP 不自动过期，因此需要关注目录增长。字节内容不同的等价 JSON 也视为不同请求。使用新 key 才会发起新的操作。
+All write requests except validate require an `Idempotency-Key` (1–128 characters). The original request and response are stored keyed by method, path, and key: retries with the same body and If-Match return the original result without re-execution; reusing a key with a different body or precondition returns 409. Records persist in the local catalog and the MVP does not expire them automatically, so watch catalog growth. Equivalent JSON with different byte content is also treated as a different request. Only a new key initiates a new operation.
 
-| 方法与路径 | 请求/行为 |
+| Method and path | Request/behavior |
 | --- | --- |
-| `GET /healthz` | 进程存活；不代表 MySQL 可用或管道健康 |
-| `GET /v1/capabilities` | 本次实现能力 |
-| `GET /v1/connections/mysql-local/inspect?tables=shop.orders` | 来源配置和类型检查、当前位置，不创建任务 |
+| `GET /healthz` | Process liveness; does not indicate MySQL availability or pipeline health |
+| `GET /v1/capabilities` | Capabilities of this implementation |
+| `GET /v1/connections/mysql-local/inspect?tables=shop.orders` | Source configuration and type check, current position; does not create a task |
 | `POST /v1/functions` | `{ "name":"orders", "source":"function transform(event) ... end" }` → 201 Function |
-| `GET /v1/functions/{function_id}` | 不可变源码与标识 |
-| `POST /v1/pipelines/validate` | 完整 Pipeline 文档 → 200 编译计划，不保存 |
-| `POST /v1/pipelines` | 完整 Pipeline 文档 → 201 草稿及 ETag |
-| `GET /v1/pipelines` | `{ "items": [...] }`；MVP 无分页 |
-| `GET /v1/pipelines/{pipeline_id}` | 草稿及 ETag |
-| `PUT /v1/pipelines/{pipeline_id}` | 完整替换草稿，必须 If-Match，返回新 revision |
-| `POST /v1/pipelines/{pipeline_id}/versions` | `{ "draft_revision":"1" }` → 201 不可变 Version |
-| `GET /v1/pipelines/{pipeline_id}/versions/{version_id}` | 已发布版本及编译计划 |
-| `POST /v1/pipelines/{pipeline_id}/instances` | `{ "version_id":"ver_..." }` → 201 STARTING，捕获当前起点及 schema |
-| `GET /v1/instances/{instance_id}` | actual/desired 状态、起点、schema、错误摘要 |
-| `POST /v1/instances/{instance_id}/pause` | `{}` → 202，异步取消在途工作并保留安全 checkpoint |
-| `POST /v1/instances/{instance_id}/resume` | `{}` → 202，从已有 checkpoint 启动 |
-| `GET /v1/instances/{instance_id}/checkpoint` | 已提交 sequence、事务 ID、version、file/position；初始 sequence=0 |
-| `GET /v1/instances/{instance_id}/outputs/{output}` | `{ "rows": [...], "checkpoint": {...} }`，同一提交快照的数据和进度，无分页 |
+| `GET /v1/functions/{function_id}` | Immutable source and identity |
+| `POST /v1/pipelines/validate` | Full Pipeline document → 200 compiled plan, not persisted |
+| `POST /v1/pipelines` | Full Pipeline document → 201 draft with ETag |
+| `GET /v1/pipelines` | `{ "items": [...] }`; no pagination in MVP |
+| `GET /v1/pipelines/{pipeline_id}` | Draft with ETag |
+| `PUT /v1/pipelines/{pipeline_id}` | Fully replaces the draft, requires If-Match, returns the new revision |
+| `POST /v1/pipelines/{pipeline_id}/versions` | `{ "draft_revision":"1" }` → 201 immutable Version |
+| `GET /v1/pipelines/{pipeline_id}/versions/{version_id}` | Published version and compiled plan |
+| `POST /v1/pipelines/{pipeline_id}/instances` | `{ "version_id":"ver_..." }` → 201 STARTING, captures the current starting position and schema |
+| `GET /v1/instances/{instance_id}` | actual/desired status, starting position, schema, error summary |
+| `POST /v1/instances/{instance_id}/pause` | `{}` → 202, asynchronously cancels in-flight work and preserves a safe checkpoint |
+| `POST /v1/instances/{instance_id}/resume` | `{}` → 202, starts from the existing checkpoint |
+| `GET /v1/instances/{instance_id}/checkpoint` | Committed sequence, transaction ID, version, file/position; initial sequence=0 |
+| `GET /v1/instances/{instance_id}/outputs/{output}` | `{ "rows": [...], "checkpoint": {...} }`, data and progress from the same commit snapshot, no pagination |
 
-首次实例请求无需用户上传 schema_baseline_ref：服务从当前来源采集并固定基线。后续恢复拒绝源 server UUID 变化和 schema 变化；不自动重新取起点或补全已有表数据。
+The first instance request needs no user-uploaded schema_baseline_ref: the service collects and pins the baseline from the current source. Subsequent recovery rejects source server UUID changes and schema changes; it does not automatically re-capture the starting position or backfill data for existing tables.
 
-创建函数示例：
+Example of creating a function:
 
 ```bash
 python3 - <<'PY' > .local/function.json
@@ -251,7 +251,7 @@ curl --fail-with-body -sS http://127.0.0.1:8080/v1/functions \
   --data-binary @.local/function.json
 ```
 
-错误示例：
+Error example:
 
 ```json
 {
@@ -263,69 +263,69 @@ curl --fail-with-body -sS http://127.0.0.1:8080/v1/functions \
 }
 ```
 
-常见状态码：400 请求/幂等键错误，404 资源不存在，409 名称/状态/幂等冲突，412 草稿版本不符，413 超大请求，415 Content-Type 错误，422 结构/能力/函数/schema 错误，428 缺少 If-Match，503 服务关闭。来源不可用等问题当前可能以 422 返回，MVP 尚未精细分类为可重试网络错误；客户端应读取 detail，不无条件重试。
+Common status codes: 400 request/idempotency-key errors, 404 resource not found, 409 name/state/idempotency conflict, 412 draft version mismatch, 413 request too large, 415 wrong Content-Type, 422 structural/capability/function/schema errors, 428 missing If-Match, 503 service shutting down. Problems such as an unavailable source may currently be returned as 422; the MVP has not yet classified these as retriable network errors; clients should read `detail` and not retry unconditionally.
 
-### Output 中的同步位点
+### Synchronized Position in Output
 
-output 响应的 `checkpoint` 表示返回的 **rows 已应用到的完整事务边界**，与单独的 checkpoint 接口结构相同。服务在同一存储锁内，从同一份 manifest 历史生成 rows 和 checkpoint；不会先读旧数据再配上新位点。
+The `checkpoint` in an output response denotes the **complete transaction boundary to which the returned rows have been applied**; it has the same structure as the standalone checkpoint endpoint. The service generates rows and checkpoint from the same manifest history under the same storage lock; it never pairs old data with a new position.
 
-- `sequence` 是实例内已提交事务序号，不是 GTID；`transaction_id` 是对应的源事务身份。
-- `position.file/position` 是该提交之后的恢复位置，不是 listener 已读取但尚未提交的位置。
-- 实例尚未提交时，rows 为空，sequence 为 0，position 为初始增量起点；这不表示初始点之前的数据已导出。
-- 全过滤事务、无关表事务及可安全跳过的无关 DDL，也可推进 checkpoint，rows 不一定变化。
-- 更新是异步的；SQL 成功后轮询 output，检查目标值或位点。可与 SQL 提交后 `SHOW BINARY LOG STATUS` 获取的源位置比较；同一文件比较 position，跨文件按源 binlog 文件顺序比较，不能只比数字偏移。
-- checkpoint 不保证随后再查询 MySQL 时源端没有继续产生新数据，也不保证任意一次 GET 都已追平源端。
+- `sequence` is the committed transaction ordinal within the instance, not a GTID; `transaction_id` is the identity of the corresponding source transaction.
+- `position.file/position` is the resume position after that commit, not the position the listener has read but not yet committed.
+- Before the instance has committed anything, rows are empty, sequence is 0, and position is the initial incremental starting point; this does not mean data before the initial point has been exported.
+- Fully filtered transactions, unrelated-table transactions, and safely skippable unrelated DDL can also advance the checkpoint; rows may not change.
+- Updates are asynchronous; after the SQL succeeds, poll the output and check the target values or position. You can compare against the source position obtained via `SHOW BINARY LOG STATUS` after the SQL commit; compare the position within the same file, and across files compare by source binlog file order, not by numeric offset alone.
+- The checkpoint does not guarantee that the source has produced no new data by the time you query MySQL again, nor that any single GET has caught up with the source.
 
-## 8. 暂停、恢复、错误与 DDL
+## 8. Pause, Resume, Errors, and DDL
 
 ```bash
 curl -sS -X POST "http://127.0.0.1:8080/v1/instances/$INSTANCE_ID/pause" \
   -H 'Content-Type: application/json' -H 'Idempotency-Key: pause-1' -d '{}'
-# 轮询 GET instance，等实际 state=PAUSED 再做其他操作
+# Poll GET instance until actual state=PAUSED before doing anything else
 curl -sS -X POST "http://127.0.0.1:8080/v1/instances/$INSTANCE_ID/resume" \
   -H 'Content-Type: application/json' -H 'Idempotency-Key: resume-1' -d '{}'
 ```
 
-状态为 STARTING、RUNNING、PAUSING、PAUSED。202 仅表示命令已记录；暂停可能取消未完成事务，恢复后会从最后提交点重放。PAUSING 时 resume 返回 409。函数、输出校验、写盘或 listener 错误会让实例进入 PAUSED，保留 last_error；不静默跳过坏事件，不自动无限重试。resume 清除上次错误并重试固定代码，若根因未消除仍会暂停。
+States are STARTING, RUNNING, PAUSING, and PAUSED. A 202 only means the command has been recorded; pausing may cancel uncommitted transactions, and after resume the pipeline replays from the last committed point. Resuming while PAUSING returns 409. Function, output-validation, disk-write, or listener errors put the instance into PAUSED with `last_error` retained; bad events are not silently skipped and there is no automatic infinite retry. resume clears the previous error and retries fixed code; if the root cause persists, the instance pauses again.
 
-正常退出服务后，desired_state=RUNNING 的实例下次以同一数据目录自动恢复；用户主动 pause 的实例保持暂停。源网络错误会暂停而非自动重连。binlog 被清理、源 UUID 改变、schema 不符都拒绝继续，不自动切到 current。
+After a normal service shutdown, instances with desired_state=RUNNING automatically recover on the next start with the same data directory; instances paused by the user remain paused. Source network errors pause the instance instead of automatically reconnecting. Purged binlogs, a changed source UUID, or a schema mismatch all refuse to continue and do not automatically switch to current.
 
-**受控 DDL**：启动/恢复比较完整 pinned schema；运行期用 SQL AST 检查 DDL 引用的表/库。已确认不涉及订阅表的建表、改表、删表、重命名及索引操作可继续，并沿正常提交链路记录零输出 checkpoint。涉及订阅表/schema、语句无法解析或无法安全分类时暂停，不跳过。订阅表 DDL 前应暂停对应实例；MVP 无 schema 版本迁移和消费点接续操作，结构改变后普通 resume 不会自动恢复。初始化期间仍须保持无 DDL 窗口。
+**Controlled DDL**: on start/resume the full pinned schema is compared; at runtime the SQL AST is used to check which tables/databases the DDL references. Confirmed create/alter/drop/rename of tables and index operations that do not touch subscribed tables may continue, and a zero-output checkpoint is recorded along the normal commit path. DDL touching subscribed tables/schemas, statements that cannot be parsed, or statements that cannot be safely classified pause the instance and are not skipped. Pause the corresponding instance before running DDL on subscribed tables; the MVP has no schema version migration or consumption-point continuation, so an ordinary resume after a structural change will not automatically recover. During initialization, keep a DDL-free window.
 
-## 9. 文件布局与 checkpoint 语义
+## 9. File Layout and Checkpoint Semantics
 
 ```text
 .local/etl/
   .server.lock
-  catalog.json                     # 函数、草稿、版本、实例、幂等响应
+  catalog.json                     # functions, drafts, versions, instances, idempotent responses
   outputs/
     .localstore.lock
     inst_.../
       00000000000000000001-<digest>-orders.jsonl
-      manifest.json                # 唯一提交真相及当前 checkpoint
+      manifest.json                # single commit truth and current checkpoint
 ```
 
-一次完整源事务的处理顺序：读取 COMMIT → Lua 全部批次 → 校验所有变更 → 写各 output 文件（包括空输出）并 fsync → 原子替换 manifest 并同步父目录。checkpoint 和文件引用同在该 manifest，避免二者分开提交形成进度漏洞。
+Processing order for one complete source transaction: read COMMIT → all Lua batches → validate all mutations → write each output file (including empty outputs) and fsync → atomically replace the manifest and fsync the parent directory. The checkpoint and the file references live in the same manifest, avoiding a progress hole from committing them separately.
 
-重放同一 transaction、sequence、版本和完全相同内容返回原提交结果；内容改变报 CONTENT_CONFLICT；序号不连续报 SEQUENCE_GAP。读取只沿 manifest 引用且校验 checksum，不扫描目录推断提交。上传/写盘后、manifest 前中断可能留下无引用文件；它们不会进入 rows，不提供自动 GC。禁止用户修改文件或从任意 JSONL 文件出现就推断事务已经提交。
+Replaying the same transaction, sequence, version, and byte-identical content returns the original commit result; changed content reports CONTENT_CONFLICT; a non-contiguous sequence reports SEQUENCE_GAP. Reads follow only manifest references and verify checksums, and never scan the directory to infer commits. An interruption between the file write and the manifest may leave unreferenced files behind; they never appear in rows, and no automatic GC is provided. Users must not modify files, nor infer that a transaction has been committed merely because some JSONL file exists.
 
-本地保证限于单进程写入、独占目录和支持相应 fsync/atomic rename 的本机文件系统。复制流可能重读，但本地提交幂等；不能据此宣称跨系统 exactly-once。数据目录丢失将同时丢失结果和恢复状态。
+Local guarantees are limited to single-process writes, an exclusive directory, and a local filesystem that supports the corresponding fsync/atomic rename. The replication stream may re-read events, but local commits are idempotent; do not claim cross-system exactly-once on this basis. Losing the data directory loses both results and recovery state.
 
-Rows 查询从完整已提交历史应用 upsert/delete，未建索引；全量 manifest 每次重写，单事务/单文件/累计 manifest 上限为 64 MiB，内存和读取成本随历史增长，适用于验证而非长期生产。listener 每事务上限为 10,000 条订阅事件或约 16 MiB 标准事件；超过即暂停。没有磁盘容量自动扩缩容或留存管理。
+Row queries apply upsert/delete from the full committed history with no index; the full manifest is rewritten on every commit, and the per-transaction/per-file/cumulative manifest limit is 64 MiB; memory and read costs grow with history, so this suits verification rather than long-term production. The listener caps each transaction at 10,000 subscribed events or roughly 16 MiB of standard events; exceeding this pauses the instance. There is no automatic disk capacity scaling or retention management.
 
-## 10. 验证与停止
+## 10. Verification and Shutdown
 
 ```bash
-make test                     # Go race 单测，默认不访问数据库
-make e2e                      # 真实 Compose MySQL + HTTP + Lua 子进程 + 临时磁盘
+make test                     # Go race unit tests, no database access by default
+make e2e                      # real Compose MySQL + HTTP + Lua subprocess + temp disk
 ```
 
-E2E 的唯一测试表在 `shop` 下创建、结束时删除；运行前检查本机 13306 是此项目 Compose MySQL。覆盖增量无全量、精确大整数与小数、复杂转换、更新删除、过滤、暂停追赶、重启恢复、幂等请求、Lua/schema 错误不推进进度、订阅表 DDL 暂停、无关表 DDL 不阻塞。具体见 `e2e/README.md`。
+The E2E suite creates its only test table under `shop` and drops it at the end; before running, check that local port 13306 is this project's Compose MySQL. Coverage includes: incremental-only with no full load, exact large integers and decimals, complex transforms, updates and deletes, filtering, pause catch-up, restart recovery, idempotent requests, Lua/schema errors not advancing progress, subscribed-table DDL pausing, and unrelated-table DDL not blocking. See `e2e/README.md` for details.
 
-停止服务使用 Ctrl-C；停止 MySQL 使用 `make mysql-down`，保留 Docker volume。不要直接删除 `.local/etl` 或 MySQL volume 后沿用旧任务。需要完全重置时先停止服务并备份数据，由用户显式删除本地目录和 Compose volume；本项目启动脚本不会自动做破坏性重置。
+Stop the service with Ctrl-C; stop MySQL with `make mysql-down`, which keeps the Docker volume. Do not delete `.local/etl` or the MySQL volume directly and then continue using old tasks. For a full reset, stop the service and back up the data first, then explicitly delete the local directory and the Compose volume yourself; the project's startup scripts never perform a destructive reset automatically.
 
-## 11. 后续 Iceberg 接入边界
+## 11. Future Iceberg Integration Boundary
 
-目标仍可采用 Iceberg v2 + Parquet + S3/Catalog，但本次不模拟该能力。后续替换 Sink 时，成功条件必须是 Iceberg 快照提交成功，而不是文件出现；还要实现提交身份核对、catalog 并发、类型映射、upsert/delete 与维护策略。S3 积压缓冲则是另外一个持久化组件，有归档水位与交付 checkpoint，当前仅有接口草案。
+The target may still adopt Iceberg v2 + Parquet + S3/Catalog in the future, but this release does not simulate that capability. When the sink is replaced later, the success criterion must be a successful Iceberg snapshot commit, not the mere appearance of files; commit identity verification, catalog concurrency, type mapping, upsert/delete, and maintenance policies must also be implemented. The S3 backlog buffer is a separate persistence component with archival watermarks and delivery checkpoints; currently there is only an interface draft.
 
-历史设计和研究文档中未实现的 PostgreSQL、WASM/Lambda、归档、升级、自动重试、manifest API 等内容，不应被解释为此次 API 已支持功能。
+Unimplemented items in historical design and research documents — PostgreSQL, WASM/Lambda, archival, upgrades, automatic retries, manifest API, etc. — must not be interpreted as features supported by this API.
