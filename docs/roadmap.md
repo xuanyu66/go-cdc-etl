@@ -68,13 +68,15 @@ Relative to a production CDC/ETL product, the MVP deliberately skips the followi
 
 ### P2 — research-stage directional goals (see [design.md](design.md) and [research/](research/))
 
+- **Clustered listener and transforms (design settled 2026-10-20, not scheduled)**: the per-instance single-reader model stays — one leader reader per instance is deliberate and matches Debezium/Maxwell, since a single MySQL binlog stream cannot be read in parallel. Scale-out targets the transform layer instead: `hash(business_key) % N` shard routing between reader and workers (per-key order preserved, global order intentionally dropped), stateless Lua workers as the scaling unit, a transaction commit barrier plus per-shard watermarks as the correctness core, and DDL as a global pause barrier. Reader HA adds leader election + fencing + a shared checkpoint store; the existing idempotency chain already absorbs the at-least-once replay this introduces. Reference points: Debezium (single reader + Kafka key partitioning), GoldenGate parallel Replicat (dependency-aware apply), TiCDC (key-range parallel pull — only possible for distributed storage sources, not MySQL), Flink CDC (PK-chunk parallel snapshot for the future initial-load goal).
 - **Iceberg v2 + Parquet / S3 sink**: the sink today is local JSONL only, as explicitly stated in the docs
-- **GTID support**: currently binlog file + position only (`internal/model`); switchover scenarios need GTID
-- **Multi-tenant isolation, distributed scheduling, autoscaling, cloud buffering**
+- **GTID support**: currently binlog file + position only (`internal/model`); switchover scenarios need GTID — also a prerequisite for clustered-reader failover
+- **Multi-tenant isolation, autoscaling, cloud buffering**
 - **WASM as a Lua-subprocess replacement**: discussed in the design doc, for stronger isolation and lower process overhead
 - **Throughput/latency benchmarks**: no benchmark data at all
 
 ## Status
 
 - Initial version: 2026-10-19, based on a full code review (including an actual `go test ./...` run)
+- 2026-10-20: marked CI and README architecture diagram delivered (P0); recorded the settled clustering/sharding design (P2)
 - Next verification: after each feature delivery, update the corresponding entry status
