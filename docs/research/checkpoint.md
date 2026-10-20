@@ -1,63 +1,63 @@
-# S3 Sink 与 Checkpoint 语义调研
+# S3 Sink and Checkpoint Semantics Research
 
-状态：设计调研及接口说明；不表示生产适配器已经实现。核验日期：2026-10-19。本文补充 [总体设计](../design.md)，代码契约以 [checkpoint](../../pkg/checkpoint/checkpoint.go) 与 [sink](../../pkg/sink/sink.go) 的实际文件为准。
+Status: design research and interface notes; this does not mean a production adapter has been implemented. Verification date: 2026-10-19. This document supplements the [design](../design.md); the code contract is authoritative in the actual [checkpoint](../../pkg/checkpoint/checkpoint.go) and [sink](../../pkg/sink/sink.go) files.
 
-## 1. 首版结论与边界
+## 1. First-Version Conclusions and Boundaries
 
-首版采用 **至少一次执行 + 独立尝试 S3 对象 + 元数据提交账本 + 完整事务 checkpoint**。这里的持久化元数据 Store 是生产要求；当前内存参考实现只验证协议，重启丢失所有状态，不能用于真实 CDC。
+The first version adopts **at-least-once execution + independent-attempt S3 objects + a metadata commit ledger + full-transaction checkpoints**. The persistent metadata Store here is a production requirement; the current in-memory reference implementation only validates the protocol, loses all state on restart, and cannot be used for real CDC.
 
-- Listener 读取位置只表示接收进度；checkpoint 表示此前完整事务的全部必需分支均已可靠完成。
-- `Receipt` 表示某个 Sink/batch 输出已持久化；它不等于整个 DAG 已提交，即 **persisted != globally committed**。
-- Coordinator 通过 `Store.Commit` 原子检查所有 required writes、当前租约、连续事务序号和前驱 revision，再同时写 commit record 与推进 checkpoint。
-- S3 与元数据库没有本设计可用的跨系统原子事务。上传后、元数据提交前崩溃时，文件可能已经可见，恢复也可能新增重复文件。
-- 首版不提供 committed manifest 查询或事务原子可见性；直接扫描 S3 的消费者必须接受未提交的部分输出，依据稳定事件标识识别重复。
+- The Listener read position only indicates receive progress; the checkpoint indicates that all required branches of every prior complete transaction have been reliably completed.
+- A `Receipt` indicates that a given Sink/batch output has been persisted; it does not mean the whole DAG has been committed, i.e. **persisted != globally committed**.
+- Through `Store.Commit`, the Coordinator atomically checks all required writes, the current lease, the continuous transaction sequence, and the predecessor revision, then writes the commit record and advances the checkpoint together.
+- There is no cross-system atomic transaction between S3 and the metadata database available to this design. If a crash happens after upload but before metadata commit, the file may already be visible, and recovery may also add duplicate files.
+- The first version does not provide committed-manifest queries or transactional atomic visibility; consumers that scan S3 directly must tolerate uncommitted partial output and identify duplicates by stable event identity.
 
-S3 为成功写入后的对象读取提供强一致性，单 key 更新原子；它没有跨 key 原子更新。这支持核验上传结果，却不能替代 DAG 提交协议。[S3 一致性模型](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html#ConsistencyModel)
+S3 provides strong consistency for reads of successfully written objects and atomic single-key updates; it has no cross-key atomic updates. This supports verifying upload results but cannot replace the DAG commit protocol. [S3 consistency model](https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html#ConsistencyModel)
 
-## 2. 提交单位、稳定身份与执行顺序
+## 2. Commit Units, Stable Identity, and Execution Order
 
-**提交单位是完整源事务，执行单位是事务内批次，物理输出单位是有界对象。** 第一版每个对象只属于一个事务，不混写多个事务。大事务可拆成多个批次，但每条 pipeline 按源事务和批次顺序执行，同一时刻只处理一个批次。不同来源或独立实例可并行；事务内批次、分支和上传并行属于后续扩展。
+**The commit unit is the complete source transaction, the execution unit is a batch within a transaction, and the physical output unit is a bounded object.** In the first version, each object belongs to exactly one transaction; multiple transactions are never mixed in one object. A large transaction may be split into multiple batches, but each pipeline executes batches in source-transaction and batch order and processes only one batch at a time. Different sources or independent instances may run in parallel; parallel batches, branches, and uploads within a transaction are follow-up extensions.
 
-事务计划必须固定来源代次、事务身份、事务序号、恢复位置、批次划分、pipeline/转换版本和 required writes。重试、扩缩容和重新部署不能更改这些逻辑身份。每个 `Write` 是 `(SinkID, BatchID)`；全部过滤或没有数据路由到的分支也要有显式 `Empty` receipt，不能因为没有 S3 对象就永远阻止 checkpoint。
+The transaction plan must pin the source generation, transaction identity, transaction sequence, recovery position, batch division, pipeline/transform version, and required writes. Retries, scaling, and redeployment must not change these logical identities. Each `Write` is `(SinkID, BatchID)`; branches that are fully filtered or receive no data must still have an explicit `Empty` receipt — the checkpoint must not be blocked forever just because no S3 object exists.
 
-GTID 标识源事务，不是可在不同 source UUID 间直接比较的全局递增整数。提交顺序使用接收并规划时分配的源序号；恢复位置保存已消费集合或完整事务后的 file/position，不用单条事件位置代替。[MySQL GTID 定义](https://dev.mysql.com/doc/refman/8.4/en/replication-gtids-concepts.html)
+GTIDs identify source transactions; they are not globally increasing integers directly comparable across different source UUIDs. Commit order uses source sequence numbers assigned at receive-and-plan time; the recovery position stores the consumed set or the file/position after a complete transaction — do not substitute a single-event position. [MySQL GTID definition](https://dev.mysql.com/doc/refman/8.4/en/replication-gtids-concepts.html)
 
-事件及输出身份沿用总体设计；输出携带 pipeline、事件 ID、转换版本和 output index。DAG 的多个 Sink 输出还应保留 Sink 身份，配置切换通过不可变 pipeline version 和实例 generation 隔离。
+Event and output identity follows the design; outputs carry the pipeline, event ID, transform version, and output index. Multiple Sink outputs of a DAG should also retain Sink identity; configuration switches are isolated by immutable pipeline version and instance generation.
 
-首版对象 key 包含 `attempt_id`，与总体设计一致。一次新的上传尝试或恢复重放可以生成新 key；因此 receipt 能记录已知对象，但并不保证 S3 中只有一份输出。超时或崩溃后的未知成功对象可能成为未引用文件。不能将文件命名或事件 ID 当作 exactly-once 证明。
+First-version object keys include `attempt_id`, consistent with the design. A new upload attempt or a recovery replay may produce a new key; therefore a receipt can record known objects but does not guarantee only one copy of the output exists in S3. Unknown-success objects after a timeout or crash may become unreferenced files. File naming or event IDs must not be treated as proof of exactly-once.
 
-## 3. 首版提交协议与 fencing
+## 3. First-Version Commit Protocol and Fencing
 
 ```text
-读取完整事务
-  → Prepare 不可变事务计划与 required sink/batch writes
-  → 顺序转换并校验一个批次
-  → Sink.Persist 上传本批次的全部对象
-  → RecordReceipt 记录持久化确认
-  → 继续后续批次，直到全部 required writes 完成
-  → Store.Commit 原子写 commit record + checkpoint
+read complete transaction
+  → Prepare immutable transaction plan and required sink/batch writes
+  → transform and validate one batch in order
+  → Sink.Persist uploads all objects of this batch
+  → RecordReceipt records the persistence acknowledgment
+  → continue with subsequent batches until all required writes complete
+  → Store.Commit atomically writes commit record + checkpoint
 ```
 
-所有声明的 Sink 在首版都是 required。某个 Sink 已成功、另一个失败时，checkpoint 保持不变；已知成功 receipt 可以保留并避免重复写，未知结果重试仍可能生成重复对象。确定性转换错误暂停流水线，临时存储错误采用有界退避。
+All declared Sinks are required in the first version. When one Sink has succeeded and another fails, the checkpoint stays unchanged; known-success receipts can be retained to avoid duplicate writes, but retries of unknown results may still produce duplicate objects. Deterministic transform errors pause the pipeline; transient storage errors use bounded backoff.
 
-生产 PostgreSQL Store 的 `Commit` 在一个事务中锁定同一实例的 lease/checkpoint 行，检查 owner、递增 fence、数据库时间下的有效期、expected revision、连续 sequence，以及 required writes 的全部 receipts。然后插入唯一 commit record、更新 checkpoint/revision 并提交。接管、续租和提交遵循同一行锁协议；S3 网络调用放在数据库事务外。数据库行锁能力参见 [PostgreSQL 锁文档](https://www.postgresql.org/docs/current/explicit-locking.html)。
+In the production PostgreSQL Store, `Commit` locks the lease/checkpoint rows of the same instance in one transaction, checks the owner, increments the fence, the validity period under database time, the expected revision, the continuous sequence, and all receipts of the required writes. It then inserts a unique commit record, updates the checkpoint/revision, and commits. Takeover, renewal, and commit all follow the same row-lock protocol; S3 network calls happen outside the database transaction. For database row-lock capabilities, see the [PostgreSQL locking documentation](https://www.postgresql.org/docs/current/explicit-locking.html).
 
-数据库提交是 checkpoint 的线性化点。旧 worker 可能仍将 S3 请求完成，但它无法提交元数据库记录。fencing 保护元数据，**不能撤销已发出的 S3 上传**。丧失租约立即取消调度；迟到对象可能成为未引用文件，至少一次语义允许这一结果。若同一提交成功但客户端响应丢失，以同一 expected revision/sequence 重试应返回已提交结果，不重复推进。
+The database commit is the linearization point of the checkpoint. An old worker may still complete its S3 requests, but it cannot commit the metadata database record. Fencing protects the metadata; it **cannot revoke an already-issued S3 upload**. Losing the lease cancels scheduling immediately; late objects may become unreferenced files, which at-least-once semantics allows. If the same commit succeeded but the client response was lost, retrying with the same expected revision/sequence should return the already-committed result without advancing again.
 
-## 4. 与代码框架一致的接口
+## 4. Interfaces Consistent with the Code Framework
 
-以下列出当前接口职责，实际签名以 `pkg/checkpoint` 和 `pkg/sink` 为准；不维护第二套兼容接口。
+The following lists the responsibilities of the current interfaces; the actual signatures are authoritative in `pkg/checkpoint` and `pkg/sink`; no second compatible interface set is maintained.
 
-| 类型 | 含义 |
+| Type | Meaning |
 | --- | --- |
-| `Scope` | 从认证所有权派生的 tenant、instance、generation |
-| `Lease` | owner、递增 fence 和有效期 |
-| `Cursor` | revision、连续 sequence、事务 ID 和 ResumeAfter |
-| `Write` | 一个必需 Sink/batch 写入身份 |
-| `Prepared` | 不可变事务计划：sequence、事务 ID、PlanDigest、恢复位置、全部 required writes |
-| `Receipt` | Write 的对象列表，或显式 Empty；只表示持久化 |
-| `CommitRecord` | 原子提交后的 Cursor、PlanDigest 与 receipts |
-| `Store` | 租约管理、Prepare、RecordReceipt 和 Commit |
+| `Scope` | tenant, instance, and generation derived from authenticated ownership |
+| `Lease` | owner, increasing fence, and validity period |
+| `Cursor` | revision, continuous sequence, transaction ID, and ResumeAfter |
+| `Write` | the identity of one required Sink/batch write |
+| `Prepared` | immutable transaction plan: sequence, transaction ID, PlanDigest, recovery position, all required writes |
+| `Receipt` | the object list of a Write, or explicit Empty; indicates persistence only |
+| `CommitRecord` | Cursor, PlanDigest, and receipts after atomic commit |
+| `Store` | lease management, Prepare, RecordReceipt, and Commit |
 
 ```go
 // checkpoint.Store
@@ -72,60 +72,60 @@ Commit(context.Context, Lease, uint64, uint64) (CommitRecord, error)
 Persist(context.Context, Request) (checkpoint.Receipt, error)
 ```
 
-`Prepare` 和 `RecordReceipt` 对相同内容幂等，相同逻辑身份不同内容拒绝。`Commit` 在 Store 内部原子验证，调用方预检查不能替代存储约束。当前错误分类为 `ErrFenced`、`ErrConflict`、`ErrIncomplete` 和 `ErrInvalid`。Sink 不提交 checkpoint，不声称全 DAG 成功。
+`Prepare` and `RecordReceipt` are idempotent for identical content and reject the same logical identity with different content. `Commit` is validated atomically inside the Store; caller-side pre-checks cannot replace the storage constraints. The current error classification is `ErrFenced`, `ErrConflict`, `ErrIncomplete`, and `ErrInvalid`. The Sink does not commit checkpoints and does not claim whole-DAG success.
 
-首版 `Prepared` 固定逻辑 writes，并未持久化每个物理对象的预期 key、大小和摘要。`Receipt` 在上传成功后记录这些信息。后续若实现严格对象复用，需要新增上传前的对象计划与恢复查询，不能假定当前接口已具备该能力。
+In the first version, `Prepared` pins the logical writes but does not persist the expected key, size, and digest of each physical object. The `Receipt` records this information after a successful upload. If strict object reuse is implemented later, a pre-upload object plan and recovery queries must be added; do not assume the current interface already provides that capability.
 
-## 5. 状态机、重试与恢复
+## 5. State Machine, Retries, and Recovery
 
 ```text
 PREPARED → PERSISTING → PERSISTED → COMMITTED
                 ↘ retry / PAUSED
 ```
 
-`PERSISTED` 表示所有 required receipts 已记录，仍未提交；`COMMITTED` 与 checkpoint 更新处于同一原子操作。`PAUSED` 是运行状态，不销毁计划。生产 Store 需持久化计划和 receipts，接管后恢复未完成事务；内存参考 Store 无法提供进程崩溃恢复。
+`PERSISTED` means all required receipts have been recorded but the transaction is not yet committed; `COMMITTED` and the checkpoint update are in the same atomic operation. `PAUSED` is a runtime state that does not destroy the plan. A production Store must persist plans and receipts and resume incomplete transactions after takeover; the in-memory reference Store cannot provide crash recovery across process restarts.
 
-| 故障时点 | 恢复动作 | Checkpoint |
+| Failure point | Recovery action | Checkpoint |
 | --- | --- | --- |
-| 计划持久化前崩溃 | 从旧位置重读并建计划 | 不变 |
-| 部分批次成功 | 复用已知 receipts，继续缺失 writes | 不变 |
-| 上传成功、receipt 未入库 | 未知成功可能产生重复文件，按原逻辑 write 重试 | 不变 |
-| Sink A 成功、Sink B 失败 | 保留 A 的已知 receipt，补 B | 不变 |
-| 全部 receipt 成功、提交前崩溃 | 当前 owner 验证完整性后原子提交 | 提交后前进 |
-| Commit 成功、响应丢失 | 重试同一提交，返回原结果 | 不重复推进 |
-| 旧 worker 上传迟到 | 不能更新 checkpoint；文件可能成为孤儿 | 新 owner 决定 |
-| binlog 已过期 | 暂停，需要恢复方案或新来源代次 | 不伪造前进 |
+| Crash before the plan is persisted | Re-read from the old position and build the plan | Unchanged |
+| Some batches succeeded | Reuse known receipts, continue the missing writes | Unchanged |
+| Upload succeeded, receipt not recorded | An unknown success may produce duplicate files; retry per the original logical write | Unchanged |
+| Sink A succeeded, Sink B failed | Keep A's known receipt, complete B | Unchanged |
+| All receipts succeeded, crash before commit | Current owner verifies completeness, then commits atomically | Advances after commit |
+| Commit succeeded, response lost | Retry the same commit, return the original result | Does not advance again |
+| Late upload from an old worker | Cannot update the checkpoint; the file may become an orphan | New owner decides |
+| Binlog has expired | Pause; requires a recovery plan or a new source generation | Do not fake progress |
 
-临时网络错误、S3 5xx/限流采用 AWS SDK standard retry，并显式配置尝试次数和截止时间；外层使用带抖动退避及总重试预算。不能在 SDK 与 Coordinator 两层无限重试。权限、桶配置错误应分类暂停。客户端超时并不证明远端请求未完成。[AWS SDK for Go v2 重试与超时](https://docs.aws.amazon.com/sdk-for-go/v2/developer-guide/configure-retries-timeouts.html)
+Transient network errors and S3 5xx/throttling use the AWS SDK standard retry, with the attempt count and deadline configured explicitly; the outer layer uses jittered backoff with a total retry budget. Unlimited retries at both the SDK and Coordinator layers are not allowed. Permission and bucket-configuration errors should be classified as pause. A client timeout does not prove the remote request did not complete. [AWS SDK for Go v2 retries and timeouts](https://docs.aws.amazon.com/sdk-for-go/v2/developer-guide/configure-retries-timeouts.html)
 
-SHA-256 记录实际压缩字节，`ETag` 不当作通用 MD5。上传校验算法应与完整对象/分片 checksum 的语义匹配。首版具体 S3 上传适配器仍待实现。[S3 上传完整性校验](https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity-upload.html)
+SHA-256 records the actual compressed bytes; `ETag` is not treated as a general-purpose MD5. The upload verification algorithm must match the semantics of full-object/multipart checksums. The concrete first-version S3 upload adapter is still to be implemented. [S3 upload integrity checking](https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity-upload.html)
 
-对象保留期应覆盖消费与恢复需求，不删除仍被账本引用的对象。孤儿清理需检查活动计划、commit 引用和保护窗口；首版可先提供人工审计，不自动删除未知文件。
+The object retention period should cover consumption and recovery needs; objects still referenced by the ledger must not be deleted. Orphan cleanup must check active plans, commit references, and protection windows; the first version may provide manual audit first and not automatically delete unknown files.
 
-## 6. 后续候选：稳定对象 key、条件写与 manifest
+## 6. Follow-up Candidates: Stable Object Keys, Conditional Writes, and Manifest
 
-本节是改进方向，**不是首版协议或已实现 API**。
+This section describes improvement directions; it is **not the first-version protocol or an implemented API**.
 
-### 稳定对象 key 与条件写
+### Stable Object Keys and Conditional Writes
 
-如需减少重放重复，可新增上传前的持久化对象计划，固定 key、字节数、SHA-256、记录顺序、编码器版本和 gzip header。稳定 key 不包含 fence 或 attempt ID；跨接管复用同一对象。重放产生不同字节时报内容冲突，不能静默覆盖。这要求变更当前 Prepared/对象计划及恢复协议，并验证确定性编码。
+To reduce replay duplicates, a persisted pre-upload object plan can be added, pinning the key, byte count, SHA-256, record order, encoder version, and gzip header. Stable keys do not include a fence or attempt ID; the same object is reused across takeovers. A replay that produces different bytes must report a content conflict and must not silently overwrite. This requires changing the current Prepared/object plan and the recovery protocol, and verifying deterministic encoding.
 
-在此方案下使用 `PutObject` 的 `If-None-Match: *`。`412` 不能直接当成功，须核对已有对象身份及真实内容摘要；需要时读取 checksum 或下载计算。PUT 的 `409` 可重试；multipart 完成时的 `409` 需要重新发起 multipart。条件写防覆盖，不验证平台 fencing token，也不提供跨对象事务。[S3 条件写](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html)
+Under this scheme, use `If-None-Match: *` on `PutObject`. A `412` must not be treated directly as success; verify the identity and real content digest of the existing object, reading the checksum or downloading to compute it when needed. A `409` on PUT is retryable; a `409` at multipart completion requires restarting the multipart. Conditional writes prevent overwrites, do not validate platform fencing tokens, and provide no cross-object transactions. [S3 conditional writes](https://docs.aws.amazon.com/AmazonS3/latest/userguide/conditional-writes.html)
 
-### Committed manifest
+### Committed Manifest
 
-后续可提供从元数据 commit records 查询的只读 API，让消费者只读取已提交对象集合；当前 OpenAPI 未实现这些端点。若导出 S3 manifest，上传 manifest 后崩溃仍不能证明元数据已提交，需定义单一提交真相及数据库 outbox 发布协议。S3 LIST、文件存在或对象通知均不能作为提交依据。
+A read-only API querying metadata commit records can be provided later, letting consumers read only the committed object set; the current OpenAPI does not implement these endpoints. If an S3 manifest is exported, a crash after uploading the manifest still does not prove the metadata was committed; a single source of commit truth and a database-outbox publication protocol must be defined. S3 LIST, file existence, or object notifications must not be used as commit evidence.
 
-即便实现上述优化，也不能自动宣称任意下游 exactly-once。通过 manifest 读取的语义与直接枚举 S3 文件不同，必须分别说明。
+Even with the above optimizations, arbitrary downstream exactly-once cannot be claimed automatically. The read semantics through a manifest differ from directly enumerating S3 files and must be documented separately.
 
-## 7. 验证清单
+## 7. Verification Checklist
 
-- 在每个状态迁移前后注入崩溃，验证不丢事务、不越过未完成分支、重复提交幂等。
-- 双 worker 竞争、租约到期和延迟上传，验证旧 fence 无法更新 checkpoint。
-- 大事务多批、多 Sink、完全过滤与无数据路由分支，都必须有全部 required receipts。
-- PUT 成功后丢失响应，验证重试允许重复文件，同时逻辑事件身份稳定。
-- 提交前切换版本，验证 pending 事务固定原版本，新版本在完整事务边界生效。
-- 内存参考测试只能证明单进程原子协议；生产 PostgreSQL 故障恢复与真实 S3 错误行为必须分别集成验证。
-- 后续条件写候选单独测试 412 内容匹配/冲突、409、multipart 重建及确定性编码。
+- Inject crashes before and after every state transition; verify no transaction is lost, no incomplete branch is skipped, and duplicate commits are idempotent.
+- Two workers competing, lease expiry, and delayed uploads: verify an old fence cannot update the checkpoint.
+- Large transactions in multiple batches, multiple Sinks, fully filtered branches, and branches with no routed data must all have complete required receipts.
+- Lost response after a successful PUT: verify the retry permits duplicate files while the logical event identity stays stable.
+- Switch versions before commit: verify pending transactions stay pinned to the original version and the new version takes effect at a complete-transaction boundary.
+- In-memory reference tests can only prove the single-process atomic protocol; production PostgreSQL failure recovery and real S3 error behavior must be verified by separate integration tests.
+- The conditional-write candidate is tested separately: 412 content match/conflict, 409, multipart rebuild, and deterministic encoding.
 
-以上提交机制是本项目工程设计，不是 AWS 或 PostgreSQL 自动提供的跨系统事务。
+The commit mechanism above is this project's engineering design, not a cross-system transaction that AWS or PostgreSQL provides automatically.

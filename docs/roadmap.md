@@ -1,80 +1,80 @@
-# Roadmap 与已知限制
+# Roadmap and Known Limitations
 
-本文档记录当前 MVP 的**已知缺陷**（代码中已存在、待修复的问题）和**缺乏的能力**（相对完整 CDC/ETL 产品的差距），以及后续规划优先级。已实现范围以 [用户文档](user-guide.md) 和 OpenAPI 为准；本文档随代码演进更新，最近核验日期见文末。
+This document records the current MVP's **known defects** (problems that exist in the code and await fixes) and **missing capabilities** (gaps relative to a full CDC/ETL product), plus their priority order. The implemented scope is authoritative in the [user guide](user-guide.md) and the OpenAPI contract; this document is updated as the code evolves — see the verification date at the end.
 
-## 已知缺陷（Known Issues）
+## Known Defects
 
-### 严重
+### Critical
 
-| # | 问题 | 位置 | 说明与计划 |
+| # | Issue | Location | Notes and plan |
 | --- | --- | --- | --- |
-| K1 | 全局互斥锁内执行重 I/O | `internal/server/http.go:76` | `mutate()` 持锁期间执行 MySQL Probe（最长 10s）和 Lua worker 子进程（最长 2s），期间所有读 API 排队。计划：锁内只做"校验 + 登记"短临界区，重操作移出锁外、结果二次校验后登记。 |
-| K2 | CDC 零重连，错误会把实例永久钉死 | `internal/mysqlcdc/mysql.go:187`、`internal/server/server.go:241` | `DisableRetrySync` + 出错即暂停且改写 DesiredState 并持久化，进程重启也不恢复。计划：增加指数退避重连（区分可重试网络错误与不可重试 schema/权限错误），暂停不再改写 DesiredState。 |
-| K3 | SEQUENCE_GAP / CONTENT_CONFLICT 无恢复出口 | `internal/localstore/store.go:214` | 一旦出现 catalog 与 manifest 不一致，实例永久卡死，只能删数据目录。计划：提供"截断到指定 sequence 重新提交"的 repair/resync 运维接口。 |
-| K4 | Lua 隔离是时间盒而非资源沙箱 | `internal/luaruntime/runtime.go:24` | 2s 超时只限时间不限内存，恶意/失控脚本可在超时前耗尽宿主内存。空环境变量只挡了凭证继承。计划：worker 加 `RLIMIT_AS` 或独立 cgroup；文档已声明不构成安全边界。 |
-| K5 | 内部错误一律 422 且外泄内部细节 | `internal/server/http.go:31` | MySQL 断连、磁盘 I/O 等内部错误被包装成"客户端请求无效"，客户端无法据此重试，detail 原文透出。计划：增加 500/503 分支并做错误脱敏。 |
-| K6 | catalog 内存态靠 JSON 往返"回滚"，吞错且副作用不可回滚 | `internal/server/http.go:107` | `json.Marshal` 错误被忽略；fn 已执行的副作用（子进程跑过、目录已建）无法随内存态回滚。计划：校验与变更分离，先算完副作用再一次性落锁提交。 |
+| K1 | Heavy I/O under a global mutex | `internal/server/http.go:76` | `mutate()` runs MySQL Probe (up to 10s) and the Lua worker subprocess (up to 2s) while holding the lock, queuing all read APIs. Plan: keep only "validate + register" in a short critical section, move heavy work outside the lock, and register results after a second validation. |
+| K2 | CDC has zero reconnects, and errors pin the instance permanently | `internal/mysqlcdc/mysql.go:187`, `internal/server/server.go:241` | `DisableRetrySync` + pause-on-error rewrites DesiredState and persists it, so the instance does not even recover after a process restart. Plan: add exponential-backoff reconnects (distinguishing retryable network errors from non-retryable schema/permission errors); pausing must not rewrite DesiredState. |
+| K3 | SEQUENCE_GAP / CONTENT_CONFLICT have no recovery path | `internal/localstore/store.go:214` | Any catalog/manifest inconsistency permanently wedges the instance; the only escape is deleting the data directory. Plan: provide a repair/resync operator interface that truncates to a given sequence and recommits. |
+| K4 | Lua isolation is a time box, not a resource sandbox | `internal/luaruntime/runtime.go:24` | The 2s timeout limits time but not memory; a malicious or runaway script can exhaust host memory before the deadline. The empty environment only blocks credential inheritance. Plan: add `RLIMIT_AS` or a dedicated cgroup to the worker; docs already state this is not a security boundary. |
+| K5 | Internal errors always return 422 and leak internals | `internal/server/http.go:31` | MySQL disconnects and disk I/O errors are wrapped as "invalid client request", so clients cannot retry appropriately, and raw internal error text is exposed. Plan: add 500/503 branches and sanitize error details. |
+| K6 | In-memory catalog "rollback" via JSON round-trip swallows errors and cannot undo side effects | `internal/server/http.go:107` | The `json.Marshal` error is ignored; side effects already executed by `fn` (worker subprocess ran, directories created) cannot roll back with the in-memory state. Plan: separate validation from mutation — compute all side effects first, then commit under a single lock acquisition. |
 
-### 中等
+### Medium
 
-| # | 问题 | 位置 | 说明与计划 |
+| # | Issue | Location | Notes and plan |
 | --- | --- | --- | --- |
-| K7 | 不支持 `binlog_transaction_compression` 源 | `internal/mysqlcdc/mysql.go:213` | MySQL 8.0.20+ 开启事务压缩的源遇 `TRANSACTION_PAYLOAD_EVENT` 直接停止，Probe 阶段也未检测。计划：Probe 增加该开关检测并在文档列出前置条件。 |
-| K8 | replication server ID 分配隐式假设"实例永不删除" | `internal/server/http.go:353` | 按 `ServerID + len(Instances)` 分配，catalog 回滚或手工编辑后可能分配出已占用 ID，两个 syncer 互相顶替。计划：改为从 catalog 实际占用值取 max + 1。 |
-| K9 | 输出视图全历史重放且与提交路径共用一把锁 | `internal/localstore/store.go:336` | `Snapshot` 持锁重读全部数据文件并重放 upsert/delete，阻塞 worker `Commit`，历史变大后一次 GET 即可卡住数据面。计划：分页/增量快照/读写锁。 |
-| K10 | manifest 64 MiB 硬上限 = 实例寿命上限 | `internal/localstore/store.go:25` | 每次提交全量重写，到顶后实例永久失败，无压缩/归档/截断。计划：manifest 分段或转追加日志，并在 capabilities 暴露水位。 |
-| K11 | TIMESTAMP 语义无端到端测试 | `e2e/mysql_lua_test.go:52` | 建了 `timestampTable` 但从未 INSERT 断言 CDC 后的字符串格式，用户文档 §6 的 UTC 语义声明零测试背书。计划：补 e2e 断言。 |
-| K12 | pause/resume 状态机靠字符串 + 互斥锁串行化硬撑 | `internal/server/server.go:216` | 旧 worker goroutine 的收尾可能覆盖 resume 后的状态，目前无测试守护该竞争窗口。计划：引入 generation/epoch 校验。 |
-| K13 | `Validate` 硬编码 `context.Background()` + 1s | `internal/luaruntime/runtime.go:99` | HTTP 层传入的可取消 ctx 无效，无法随客户端断开取消；初始化复杂度上限不可配置。 |
+| K7 | Sources with `binlog_transaction_compression` unsupported | `internal/mysqlcdc/mysql.go:213` | MySQL 8.0.20+ with transaction compression hits `TRANSACTION_PAYLOAD_EVENT` and stops; Probe does not detect the setting either. Plan: detect the setting during Probe and list it in the documented prerequisites. |
+| K8 | Replication server ID allocation assumes instances are never deleted | `internal/server/http.go:353` | `ServerID + len(Instances)` can hand out an ID already in use after a catalog rollback or manual edit; two binlog syncers sharing one ID kick each other off, with bizarre symptoms. Plan: allocate max(used IDs) + 1 from the catalog. |
+| K9 | Output view replays full history and shares one store lock with commits | `internal/localstore/store.go:336` | `Snapshot` holds the lock while re-reading and re-decoding all data files and replaying upsert/delete, blocking worker `Commit`; once history grows, one GET can stall the data plane. Plan: pagination / incremental snapshots / read-write lock. |
+| K10 | The 64 MiB manifest cap is the instance lifetime cap | `internal/localstore/store.go:25` | The manifest is fully rewritten on every commit and capped at 64 MiB; reaching the cap permanently fails the instance — no compaction, archival, or truncation. Plan: segment the manifest or switch to an append log, and expose a watermark in capabilities. |
+| K11 | TIMESTAMP semantics have no end-to-end test | `e2e/mysql_lua_test.go:52` | A `timestampTable` is created but never inserted into or asserted against; the user guide §6 claims about UTC semantics (TIMESTAMP as UTC, DATETIME without timezone) have zero test backing. Plan: add e2e assertions. |
+| K12 | The pause/resume state machine leans on string states + mutex serialization | `internal/server/server.go:216` | Cleanup from an old worker goroutine can overwrite state after a resume; no test guards this race window (e2e only covers sequential pause→resume). Plan: introduce generation/epoch validation. |
+| K13 | `Validate` hardcodes `context.Background()` + 1s | `internal/luaruntime/runtime.go:99` | The cancellable ctx passed from the HTTP layer is discarded; init cannot be cancelled on client disconnect, the 1s deadline caps initialization complexity, and neither is configurable. |
 
-### 低优先
+### Low priority
 
-| # | 问题 | 位置 | 说明 |
+| # | Issue | Location | Notes |
 | --- | --- | --- | --- |
-| K14 | 批处理循环 O(n²) marshal 且吞错 | `internal/server/server.go:292` | 每迭代全量重编 candidate，应增量估算或先 marshal 再切片。 |
-| K15 | 每事件重建 VM 并重新编译整个 Lua 源码 | `internal/luaruntime/runtime.go:131` | 10k 事件事务 = 1 万次编译同一源码，`Parse` 一次复用 chunk 可提升一个数量级（保持每事件新全局环境语义）。 |
-| K16 | `Server.Close` 超时路径泄漏 store/lock | `internal/server/server.go:159` | ctx 超时直接返回，跳过 `store.Close()` 和文件锁释放。 |
-| K17 | `string.dump` 未从 Lua string 库剔除 | `internal/luaruntime/runtime.go:45` | 白名单完备性漏洞，本场景危害极小。 |
-| K18 | catalog 与 store manifest 是两套持久化真相 | `internal/server/server.go:205`、`internal/localstore/store.go:267` | 崩溃恢复靠各自动作幂等拼回，K6/K8 的脆弱性源于此分裂。计划：design 文档补崩溃矩阵及对应测试。 |
-| K19 | main 退出路径错误处理不严 | `cmd/etl/main.go:106` | `Shutdown` 错误被忽略，首个错误来源丢失。 |
-| K20 | 两套 CDC 模型字段类型不一致 | `internal/model/model.go:8`、`pkg/cdc/types.go:13` | Position 的 JSON tag 与位宽（uint32 vs uint64）不统一，接 GTID/切主时是类型地雷，应现在统一。 |
+| K14 | Batch loop is O(n²) marshal and swallows errors | `internal/server/server.go:292` | Re-marshals the full candidate every iteration; should incrementally estimate or marshal once then slice. |
+| K15 | Every event rebuilds the VM and recompiles the whole Lua source | `internal/luaruntime/runtime.go:131` | A 10k-event transaction means 10k compilations of the same source; parsing the chunk once (while keeping the per-event fresh-globals semantics) is an order-of-magnitude win. |
+| K16 | `Server.Close` leaks store/lock on the timeout path | `internal/server/server.go:159` | The `ctx.Done()` branch returns without `store.Close()` and file-lock release. Harmless on process exit, but leaves dirty lock files in tests/embedded use. |
+| K17 | `string.dump` not removed from the Lua string library | `internal/luaruntime/runtime.go:45` | Whitelist completeness gap; negligible impact in this scenario. |
+| K18 | catalog and store manifest are two separate persistence truths | `internal/server/server.go:205`, `internal/localstore/store.go:267` | Instance metadata/catalog idempotency keys live in the catalog; checkpoints live in the manifest; crash recovery is stitched together from each side's idempotency. It holds today, but K6/K8 fragility stems from this split. Plan: draw a crash matrix in the design doc and add tests for it. |
+| K19 | main's exit path handles errors loosely | `cmd/etl/main.go:106` | The `Shutdown` error is ignored and the first error source is lost. |
+| K20 | Two CDC models with inconsistent field types | `internal/model/model.go:8`, `pkg/cdc/types.go:13` | Position JSON tags and widths (uint32 vs uint64) disagree — a type landmine when GTID/switchover support lands. Unify now. |
 
-## 缺乏的能力（Missing Capabilities）
+## Missing Capabilities
 
-相对一个可生产的 CDC/ETL 产品，MVP 明确未做、按优先级规划如下：
+Relative to a production CDC/ETL product, the MVP deliberately skips the following, planned by priority:
 
-### P0 — 面试作业到"可演示给别人"的近期补齐
+### P0 — from interview assignment to "demoable to others"
 
-| 能力 | 现状 | 计划 |
+| Capability | Current state | Plan |
 | --- | --- | --- |
-| CI | 无 `.github/workflows`，push 后测试不自动跑 | GitHub Actions：gofmt + `go vet` + `go test ./...` |
-| 故障注入 e2e | 只有优雅 `Close()` 重启，无 SIGKILL/杀 worker/断连场景 | kill -9 中途崩溃恢复、Lua 执行中杀 worker、源断连重连 |
-| `pkg/` 草案包归宿 | `buffer`/`cdc`/`checkpoint`/`listener`/`orchestrator`/`sink`/`transform` 七个包零测试且未接入运行链路 | 接入实现或降级为 docs 附件，避免"死代码"印象 |
-| README 架构图 | 只有未实现愿景的 mermaid（`docs/design.md:26`） | 补一张 MVP 实际链路图（binlog → listener → Lua 子进程 → manifest） |
-| LICENSE | 缺失 | 补 MIT/Apache-2.0 |
+| CI | no `.github/workflows`; tests do not run on push | GitHub Actions: gofmt + `go vet` + `go test ./...` |
+| Failure-injection e2e | only graceful `Close()` restart; no SIGKILL/worker-kill/disconnect scenarios | kill -9 mid-crash recovery, kill Lua worker mid-execution, source disconnect/reconnect |
+| Fate of the `pkg/` draft packages | `buffer`/`cdc`/`checkpoint`/`listener`/`orchestrator`/`sink`/`transform` have zero tests and are not wired in | wire them in or demote to docs attachments to avoid a "dead code" impression |
+| README architecture diagram | only the not-implemented-vision mermaid exists (`docs/design.md:26`) | add a diagram of the actual MVP path (binlog → listener → Lua subprocess → manifest) |
+| LICENSE | missing | add MIT/Apache-2.0 |
 
-### P1 — 从 MVP 到可信的单机工具
+### P1 — from MVP to a credible single-node tool
 
-| 能力 | 现状 | 计划 |
+| Capability | Current state | Plan |
 | --- | --- | --- |
-| CDC 断线重连 | 零重连（见 K2） | 指数退避 + 心跳 + 错误分类 |
-| 运维恢复出口 | 一致性错误只能删目录（见 K3） | repair/resync 接口 |
-| API 错误语义 | 内部错误一律 422（见 K5） | 500/503 分支 + 脱敏 |
-| 输出读取扩展性 | 全历史重放（见 K9） | 分页、增量快照 |
-| manifest 规模 | 64 MiB 到顶即死（见 K10） | 分段 manifest / 追加日志 + 水位暴露 |
-| 资源隔离 | 时间盒沙箱（见 K4） | RLIMIT/cgroup |
-| Lua 性能 | 每事件重编译（见 K15） | chunk 复用 |
-| 大事务处理 | 100 事件 / 900KB 批切分阈值固定 | 可配置 + 大事务跨批次拆分测试 |
+| CDC reconnect | zero reconnects (see K2) | exponential backoff + heartbeat + error classification |
+| Operator recovery path | consistency errors only fixable by deleting data (see K3) | repair/resync interface |
+| API error semantics | internal errors always 422 (see K5) | 500/503 branches + sanitization |
+| Output read scalability | full-history replay (see K9) | pagination, incremental snapshots |
+| Manifest size | dies at 64 MiB (see K10) | segmented manifest / append log + watermark exposure |
+| Resource isolation | time-box sandbox (see K4) | RLIMIT/cgroup |
+| Lua performance | per-event recompile (see K15) | chunk reuse |
+| Large transactions | fixed 100-event / 900KB batch-split thresholds | configurable + large-transaction split tests |
 
-### P2 — 调研中、方向性目标（详见 [design.md](design.md) 与 [research/](research/)）
+### P2 — research-stage directional goals (see [design.md](design.md) and [research/](research/))
 
-- **Iceberg v2 + Parquet / S3 Sink**：当前 sink 仅为本地 JSONL，文档已明确声明
-- **GTID 支持**：当前仅 binlog file + position（`internal/model`），切主场景依赖 GTID
-- **多租户隔离、分布式调度、自动扩缩容、云缓冲**
-- **WASM 替代 Lua 子进程**：design 中有讨论，用于更强隔离与更低进程开销
-- **吞吐/延迟基准测试**：无任何 benchmark 数据
+- **Iceberg v2 + Parquet / S3 sink**: the sink today is local JSONL only, as explicitly stated in the docs
+- **GTID support**: currently binlog file + position only (`internal/model`); switchover scenarios need GTID
+- **Multi-tenant isolation, distributed scheduling, autoscaling, cloud buffering**
+- **WASM as a Lua-subprocess replacement**: discussed in the design doc, for stronger isolation and lower process overhead
+- **Throughput/latency benchmarks**: no benchmark data at all
 
-## 状态
+## Status
 
-- 文档初版：2026-10-19，基于全量代码评审（含 `go test ./...` 实测通过）
-- 下次核验：每轮功能交付后更新对应条目状态
+- Initial version: 2026-10-19, based on a full code review (including an actual `go test ./...` run)
+- Next verification: after each feature delivery, update the corresponding entry status

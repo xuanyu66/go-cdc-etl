@@ -1,36 +1,36 @@
-# 数据管道编排与 API 调研
+# Data Pipeline Orchestration and API Research
 
-核验日期：2026-10-19。本文提出接口设计，不代表服务已经实现；项目总览见 [design.md](../design.md)。本轮交付 OpenAPI、JSON Schema 和 Go 代码骨架；CLI 实现 Go 结构与图校验，尚未集成通用 JSON Schema 校验器，也未实现 HTTP handler、资源鉴权或连接测试。
+Verification date: 2026-10-19. This document proposes interface design and does not mean the service has been implemented; see [design.md](../design.md) for the project overview. This round delivers the OpenAPI, JSON Schema, and a Go code skeleton; the CLI implements Go-structure and graph validation, but a generic JSON Schema validator is not yet integrated, and HTTP handlers, resource authorization, and connection testing are not implemented.
 
-## 1. 推荐方案与标准边界
+## 1. Recommended Approach and Standard Boundaries
 
-采用 **OpenAPI 3.1.1 + JSON Schema 2020-12 + 小型声明式数据流定义**。HTTP 接口使用 JSON；本次代码框架 CLI 使用 JSON，JSON 文档本身也符合 YAML 1.2。一般 YAML 输入适配器留待后续添加，不宣称当前支持任意 YAML 文件。这样用户只需认识来源、转换、目标及连线，不需要先学习通用工作流引擎。
+The approach is **OpenAPI 3.1.1 + JSON Schema 2020-12 + a small declarative dataflow definition**. HTTP interfaces use JSON; the code-framework CLI in this round also uses JSON, and JSON documents themselves are valid YAML 1.2. A general YAML input adapter is left for later; arbitrary YAML file support is not claimed. This way users only need to understand sources, transforms, sinks, and the connections between them, without first learning a general workflow engine.
 
-未发现能直接统一 MySQL CDC、持续数据流、事务边界、分支确认及 S3 checkpoint 的通用 DAG 标准。以下协议需要本项目明确，不能通过选一种 YAML 外观自动获得。
+No generic DAG standard was found that directly unifies MySQL CDC, continuous data streams, transaction boundaries, branch acknowledgment, and S3 checkpoints. The following protocols must be defined explicitly by this project; they cannot be obtained automatically by picking a YAML look.
 
-| 候选 | 实际标准化内容 | 本项目取舍 |
+| Candidate | What it actually standardizes | This project's trade-off |
 | --- | --- | --- |
-| OpenAPI | HTTP 路径、请求响应、鉴权、接口文档和客户端生成 | 用来描述控制面，不负责 DAG 执行或 checkpoint。[官方规范](https://spec.openapis.org/oas/v3.1.1.html) |
-| JSON Schema | JSON 文档结构、字段类型和局部约束 | 用于 IDE 提示和结构校验；环路、可达性、资源访问权限仍由服务校验。[官方规范](https://json-schema.org/draft/2020-12) |
-| CNCF Serverless Workflow / Open Workflow Specification | 服务调用、事件驱动及控制流程的声明式工作流 | 官网目前以 Open Workflow Specification 展示，并标注 DSL 1.0.3。可借鉴定义与实例分离，但不直接采用完整 DSL；需要额外自定义 CDC 的持续运行和确认语义。[官方主页](https://open-workflow-specification.org/) |
-| Argo Workflows | Kubernetes 上任务完成依赖的 DAG | `dependencies` 表示任务完成后再运行，不等于数据沿边持续传递；不按每条 CDC 事件创建 Pod 或 Workflow。[官方 DAG 文档](https://argo-workflows.readthedocs.io/en/latest/walk-through/dag/) |
-| Redpanda Connect（Benthos 系谱） | YAML 描述 input、processors、output 及其产品执行行为 | 最接近流式数据集成体验，借鉴组件配置和输入输出模型；它是具体产品配置，并非跨引擎 CDC 标准。[配置](https://docs.redpanda.com/connect/configuration/about/)、[处理管道](https://docs.redpanda.com/connect/configuration/processing_pipelines/) |
+| OpenAPI | HTTP paths, request/response, auth, API documentation, and client generation | used to describe the control plane; not responsible for DAG execution or checkpoints. [Official spec](https://spec.openapis.org/oas/v3.1.1.html) |
+| JSON Schema | JSON document structure, field types, and local constraints | used for IDE hints and structural validation; cycles, reachability, and resource access permissions are still validated by the service. [Official spec](https://json-schema.org/draft/2020-12) |
+| CNCF Serverless Workflow / Open Workflow Specification | declarative workflows for service invocation, event-driven, and control flow | the official site currently presents the Open Workflow Specification, marked as DSL 1.0.3. Definition/instance separation is worth borrowing, but the full DSL is not adopted directly; CDC continuous running and acknowledgment semantics require extra customization. [Official site](https://open-workflow-specification.org/) |
+| Argo Workflows | DAGs of task-completion dependencies on Kubernetes | `dependencies` means the downstream runs after the upstream task completes, not that data flows continuously along edges; no per-CDC-event Pod or Workflow creation. [Official DAG docs](https://argo-workflows.readthedocs.io/en/latest/walk-through/dag/) |
+| Redpanda Connect (Benthos lineage) | YAML-described input, processors, output, and their product execution behavior | closest to the streaming data-integration experience; borrow component configuration and the input/output model; it is concrete product configuration, not a cross-engine CDC standard. [Configuration](https://docs.redpanda.com/connect/configuration/about/), [processing pipelines](https://docs.redpanda.com/connect/configuration/processing_pipelines/) |
 
-配置语义选择 nodes/edges 而不是同时提供 processors 简写与完整图两套 DSL，避免用户面对两种等价写法。图形编辑器后续直接读写同一份定义。v1 不引入表达式语言；过滤和字段映射使用转换函数，避免同时学习 Lua/WASM SDK 和另一种表达式 DSL。
+For configuration semantics, nodes/edges are chosen instead of offering both a processors shorthand and a full-graph DSL, avoiding two equivalent syntaxes for users. The future graph editor reads and writes the same definition directly. v1 introduces no expression language; filtering and field mapping use transform functions, avoiding learning a Lua/WASM SDK plus another expression DSL at the same time.
 
-## 2. 定义、版本和运行实例
+## 2. Definitions, Versions, and Running Instances
 
-- **Pipeline Definition**：可编辑的配置，具有 `pipeline_id` 和单调递增 `revision`。
-- **Pipeline Version**：发布时产生的不可变快照，具有 `version_id`、规范化配置摘要和固定转换制品摘要；配置默认值在发布时展开。
-- **Pipeline Instance**：某个版本的长期运行实例，具有 `instance_id`、输出 `generation`、状态、checkpoint 和执行租约。进程重启或迁移不创建新输出世代。
+- **Pipeline Definition**: the editable configuration, with `pipeline_id` and a monotonically increasing `revision`.
+- **Pipeline Version**: the immutable snapshot produced at publish time, with `version_id`, a normalized configuration digest, and a fixed transform-artifact digest; configuration defaults are expanded at publish time.
+- **Pipeline Instance**: a long-running instance of a given version, with `instance_id`, output `generation`, state, checkpoint, and execution lease. Process restart or migration does not create a new output generation.
 
-编辑草稿不影响正在运行的实例。v1 实例版本固定；暂停和恢复不会修改版本、来源起点或输出世代。本轮不提供 upgrade/stop API。后续升级、失败事务修复和历史重算需要独立流程，必须明确未提交事务、来源与输出世代的处理，不能通过覆盖已发布版本实现。
+Editing the draft does not affect running instances. In v1 an instance's version is fixed; pausing and resuming does not modify the version, source start position, or output generation. This round does not provide upgrade/stop APIs. Later upgrades, failed-transaction repair, and historical recomputation require separate processes that must make explicit how uncommitted transactions, sources, and output generations are handled; they cannot be achieved by overwriting a published version.
 
-本轮生命周期围绕 `STARTING → RUNNING → PAUSING → PAUSED → RUNNING` 定义。可恢复错误进入 `PAUSED` 并附原因；源 binlog 缺口进入 `NEEDS_RESEED`，不得通过普通 resume 自动跳过缺口。暂停仅在事务安全边界完成，崩溃则从最后提交 checkpoint 恢复。
+This round's lifecycle is defined around `STARTING → RUNNING → PAUSING → PAUSED → RUNNING`. Recoverable errors enter `PAUSED` with a reason; a source binlog gap enters `NEEDS_RESEED` and must not be silently skipped via ordinary resume. Pausing completes only at a transaction-safe boundary; after a crash, recovery resumes from the last committed checkpoint.
 
-## 3. 最小数据流配置
+## 3. Minimal Dataflow Configuration
 
-以下字段是本项目拟定格式，不声称兼容 Kubernetes、Argo 或 Serverless Workflow。
+The fields below are this project's proposed format; compatibility with Kubernetes, Argo, or Serverless Workflow is not claimed.
 
 ```yaml
 api_version: v1
@@ -68,53 +68,53 @@ spec:
       to: archive
 ```
 
-`connection_ref` 是预先注册、按租户鉴权的资源标识；`artifact_ref` 为不可变 `sha256:<64位小写十六进制>` 标识；定义内不能填写密码、访问密钥或可变远端代码地址。完整服务发布时需要验证制品摘要存在、归属与连接类型及目标授权范围；这些资源校验尚未实现。连接凭证可轮换，但不能借凭证轮换更改来源身份或目标 bucket。
+`connection_ref` is a pre-registered, tenant-authorized resource identifier; `artifact_ref` is an immutable `sha256:<64 lowercase hex>` identifier; the definition must not contain passwords, access keys, or mutable remote code locations. A full service publish needs to verify the artifact digest exists, its ownership, and the connection type and target authorization scope; these resource validations are not yet implemented. Connection credentials may be rotated, but credential rotation must not change the source identity or the target bucket.
 
-字段规范：
+Field specification:
 
-| 字段 | 约束及语义 |
+| Field | Constraints and semantics |
 | --- | --- |
-| `api_version`、`kind` | 固定为 `v1`、`Pipeline`；不为未上线格式添加兼容分支 |
-| `metadata.name` | 正则 `^[a-z][a-z0-9_-]{0,62}$`；租户内唯一性由后续控制面保证 |
-| `spec.nodes[].id` | 同样的字符规则，图内唯一；语义标识，不按数组下标识别节点 |
-| `type` | v1 实现 `source.mysql`、`transform.wasm`、`sink.s3`；Lua/Lambda 为候选，不接受尚未实现的节点类型 |
-| `mysql.tables` | 至少一项精确 `database.table` 字符串，例如 `["shop.orders"]`；首版不支持通配符或动态匹配新表 |
-| `s3.prefix` | 目标连接授权范围内的相对业务前缀；平台另加 tenant/pipeline/generation 身份，不能覆盖其他租户路径 |
-| `spec.edges[]` | `from` 与 `to` 指向节点；边传递记录流，不是“上游任务结束后启动下游” |
+| `api_version`, `kind` | fixed to `v1` and `Pipeline`; no compatibility branches are added for unreleased formats |
+| `metadata.name` | regex `^[a-z][a-z0-9_-]{0,62}$`; uniqueness within a tenant is guaranteed by the later control plane |
+| `spec.nodes[].id` | same character rules, unique within the graph; a semantic identifier — nodes are not identified by array index |
+| `type` | v1 implements `source.mysql`, `transform.wasm`, `sink.s3`; Lua/Lambda are candidates, and not-yet-implemented node types are rejected |
+| `mysql.tables` | at least one exact `database.table` string, e.g. `["shop.orders"]`; the first version does not support wildcards or dynamically matching new tables |
+| `s3.prefix` | a relative business prefix within the target connection's authorized scope; the platform additionally adds tenant/pipeline/generation identity and must not overwrite other tenants' paths |
+| `spec.edges[]` | `from` and `to` reference nodes; an edge carries a record stream, not "start the downstream after the upstream task finishes" |
 
-v1 图约束：
+v1 graph constraints:
 
-1. 恰好一个 source，至少一个 sink，无自环、重复边和环路。
-2. source 入度为零，sink 出度为零；所有非 source 节点入度恰为一。
-3. 每个节点从 source 可达，并可到达某个 sink；所有分支都是交付必需分支。
-4. 允许分叉，向各分支复制相同输入；禁止汇合、Join、窗口聚合及有状态节点。并发分支不会改变源事务的统一提交边界。
-5. 转换允许零到多条输出；过滤为零条时仍传递完成确认，不能让后续 sink 永远等待。
-6. 原型限制每条路径最多一个转换节点。现有 `design.md` 的转换协议以源事件 ID 为输入关联标识；多级拆分会使该标识不再唯一，因此多级转换须先引入平台生成的逐级记录 ID 和 lineage 协议，再放开，不能直接复用源事件 ID 作为每级唯一键。
+1. Exactly one source, at least one sink, and no self-loops, duplicate edges, or cycles.
+2. The source has in-degree zero and sinks have out-degree zero; every non-source node has in-degree exactly one.
+3. Every node is reachable from the source and can reach some sink; all branches are delivery-required branches.
+4. Forking is allowed, replicating the same input to each branch; merges, joins, window aggregations, and stateful nodes are forbidden. Concurrent branches do not change the unified commit boundary of the source transaction.
+5. A transform may produce zero to multiple outputs; when filtering yields zero, the completion acknowledgment is still passed on — downstream sinks must not wait forever.
+6. The prototype limits each path to at most one transform node. The transform protocol in the current `design.md` uses the source event ID as the input correlation identifier; multi-level splitting would make that identifier non-unique, so multi-level transforms must first introduce platform-generated per-level record IDs and a lineage protocol before being enabled; the source event ID must not be reused directly as the per-level unique key.
 
-第一版不要求用户配置 checkpoint 算法、内部缓冲、worker 数或确认模式。运行资源由平台配额管理；后续性能参数须与业务图版本分开，防止扩缩容意外改变处理逻辑。
+The first version does not ask users to configure checkpoint algorithms, internal buffers, worker counts, or acknowledgment modes. Runtime resources are managed by platform quotas; later performance parameters must be separated from the business graph version to prevent scaling from accidentally changing processing logic.
 
-## 4. HTTP 控制面规范建议
+## 4. HTTP Control Plane Specification Proposal
 
-统一前缀 `/v1`，请求和成功响应为 `application/json`。Bearer token 决定租户身份，body 不接受可覆盖身份的 `tenant_id`。资源跨租户不可见。下面是目标契约，不表示端点已实现。
+Uniform prefix `/v1`; requests and success responses are `application/json`. A Bearer token determines tenant identity; the body does not accept a `tenant_id` that overrides identity. Resources are invisible across tenants. The table below is the target contract and does not mean the endpoints are implemented.
 
-| 方法与路径 | 目的 | 成功响应 |
+| Method and path | Purpose | Success response |
 | --- | --- | --- |
-| `POST /v1/pipelines/validate` | 校验并编译完整 Pipeline 文档，不保存，不连接用户 MySQL；资源鉴权另待实现 | `200`，编译后的 `Plan` |
-| `POST /v1/pipelines` | 创建草稿，body 为完整 Pipeline 文档 | `201`，资源 body、`Location`、`ETag` |
-| `GET /v1/pipelines?limit=20&cursor=...` | 游标分页，返回 `items`、`next_cursor` | `200` |
-| `GET /v1/pipelines/{pipeline_id}` | 读取草稿及 revision | `200`，`ETag` |
-| `PUT /v1/pipelines/{pipeline_id}` | 完整替换草稿，要求 `If-Match` | `200`，新 revision 与 `ETag` |
-| `POST /v1/pipelines/{pipeline_id}/versions` | body 为 `{"draft_revision":"3"}`（十进制字符串），校验并发布不可变快照 | `201`，version 资源 |
-| `GET /v1/pipelines/{pipeline_id}/versions/{version_id}` | 读取固定配置和解析后的依赖摘要 | `200` |
-| `POST /v1/pipelines/{pipeline_id}/instances` | 使用固定版本和已验证起点创建实例 | `201`，初始 `STARTING` 状态及 `Location` |
-| `GET /v1/instances/{instance_id}` | 返回实际/期望状态、错误摘要、当前版本 | `200` |
-| `POST /v1/instances/{instance_id}/pause` | 排空到事务边界，body 为 `{}` | `202`，返回实例供轮询 |
-| `POST /v1/instances/{instance_id}/resume` | 从当前 checkpoint 恢复，body 为 `{}` | `202`，返回实例供轮询 |
-| `GET /v1/instances/{instance_id}/checkpoint` | 只读消费进度及来源身份，不暴露租约 token | `200` |
+| `POST /v1/pipelines/validate` | validate and compile the complete Pipeline document; does not save and does not connect to the user's MySQL; resource authorization to be implemented separately | `200`, the compiled `Plan` |
+| `POST /v1/pipelines` | create a draft; body is the complete Pipeline document | `201`, resource body, `Location`, `ETag` |
+| `GET /v1/pipelines?limit=20&cursor=...` | cursor pagination, returning `items`, `next_cursor` | `200` |
+| `GET /v1/pipelines/{pipeline_id}` | read the draft and revision | `200`, `ETag` |
+| `PUT /v1/pipelines/{pipeline_id}` | fully replace the draft; requires `If-Match` | `200`, new revision and `ETag` |
+| `POST /v1/pipelines/{pipeline_id}/versions` | body is `{"draft_revision":"3"}` (decimal string); validates and publishes an immutable snapshot | `201`, version resource |
+| `GET /v1/pipelines/{pipeline_id}/versions/{version_id}` | read the fixed configuration and the resolved dependency digest | `200` |
+| `POST /v1/pipelines/{pipeline_id}/instances` | create an instance with a fixed version and a validated start position | `201`, initial `STARTING` state and `Location` |
+| `GET /v1/instances/{instance_id}` | return actual/desired state, error summary, current version | `200` |
+| `POST /v1/instances/{instance_id}/pause` | drain to a transaction boundary; body is `{}` | `202`, returns the instance for polling |
+| `POST /v1/instances/{instance_id}/resume` | resume from the current checkpoint; body is `{}` | `202`, returns the instance for polling |
+| `GET /v1/instances/{instance_id}/checkpoint` | read-only consumption progress and source identity; does not expose the lease token | `200` |
 
-暂停和恢复是异步状态转换；`202` 仅表示请求已持久化接受，用户通过实例 GET 确认最终状态。重复请求相同目标状态返回当前实例；与正在进行的转换冲突则 `409`。暂停失败可保留故障原因，不能把 HTTP 接受当作已排空。
+Pause and resume are asynchronous state transitions; `202` only means the request has been durably accepted, and the user confirms the final state via the instance GET. Repeating a request for the same target state returns the current instance; a conflict with an in-flight transition returns `409`. A failed pause may retain the failure reason; HTTP acceptance must not be treated as drained.
 
-创建实例请求示意：
+Create-instance request example:
 
 ```json
 {
@@ -123,13 +123,13 @@ v1 图约束：
 }
 ```
 
-来源定义的 `mysql.start.mode` 为 `gtid` 或 `file_position`；前者要求 `gtid_set`，后者要求 `file` 和十进制字符串 `position`，两组字段互斥。GTID set 表示已经消费的集合，从未消费事务继续；file/position 表示已经完成事务之后的下一事件边界。起点属于固定版本；实例创建解析来源身份并验证 schema 基线，历史起点缺少匹配 schema 历史则拒绝启动。普通 resume 不接受新起点；现有实例重启始终使用其 checkpoint，不重新套用定义中的初始起点。
+The source definition's `mysql.start.mode` is `gtid` or `file_position`; the former requires `gtid_set`, the latter requires `file` and a decimal-string `position`, and the two field sets are mutually exclusive. A GTID set is the consumed set; processing continues from never-consumed transactions; file/position is the next-event boundary after the last completed transaction. The start position belongs to the fixed version; instance creation resolves the source identity and validates the schema baseline, and a historical start position lacking matching schema history is rejected. Ordinary resume does not accept a new start position; restarting an existing instance always uses its checkpoint and never re-applies the initial start position from the definition.
 
-写请求使用项目定义的 `Idempotency-Key`，按租户、方法、规范化路径及 key 存储请求摘要与结果；相同请求重试返回相同结果，不同 body 复用 key 返回 `409`。至少覆盖创建、发布和生命周期命令；建议保存期固定为 24 小时并写入正式 OpenAPI；客户端不得把过期 key 当永久去重机制。`If-Match` 用于草稿并发编辑，缺少条件返回 `428`，revision 不符返回 `412`。两者分别解决请求重试和并发更新，不互相替代。
+Write requests use the project-defined `Idempotency-Key`, storing a request digest and result keyed by tenant, method, normalized path, and key; retrying an identical request returns the identical result, while reusing the key with a different body returns `409`. It must cover at least create, publish, and lifecycle commands; a fixed retention period of 24 hours is recommended and should be written into the formal OpenAPI; clients must not treat expired keys as a permanent deduplication mechanism. `If-Match` is used for draft concurrent editing: missing the condition returns `428`, and a revision mismatch returns `412`. The two solve request retries and concurrent updates respectively and do not replace each other.
 
-### 错误响应
+### Error Responses
 
-采用 [RFC 9457 Problem Details](https://www.rfc-editor.org/rfc/rfc9457.html)，媒体类型 `application/problem+json`；`errors`、`code` 和 `request_id` 是项目扩展字段。`pointer` 为请求 JSON 的 JSON Pointer，不返回密码、行数据或内部堆栈。
+Use [RFC 9457 Problem Details](https://www.rfc-editor.org/rfc/rfc9457.html) with media type `application/problem+json`; `errors`, `code`, and `request_id` are project extension fields. `pointer` is a JSON Pointer into the request JSON; passwords, row data, and internal stacks are not returned.
 
 ```json
 {
@@ -149,11 +149,11 @@ v1 图约束：
 }
 ```
 
-状态码约定：非法 JSON 为 `400`；认证失败 `401`；权限不足 `403`；不可见资源 `404`；状态/幂等冲突 `409`；并发版本冲突 `412`；请求体超限 `413`；格式正确但结构或图不合法 `422`；限流 `429`；临时基础设施故障 `503`。重试建议通过 `Retry-After` 返回，不能让客户端无条件重试确定性配置错误。
+Status code conventions: malformed JSON is `400`; authentication failure `401`; insufficient permission `403`; invisible resource `404`; state/idempotency conflict `409`; concurrent version conflict `412`; request body too large `413`; well-formed but structurally or graph-invalid `422`; rate limited `429`; transient infrastructure failure `503`. Retry advice should be returned via `Retry-After`; clients must not unconditionally retry deterministic configuration errors.
 
-## 5. 编译器与执行接口边界
+## 5. Compiler and Execution Interface Boundaries
 
-大致代码模块：`pipeline` 存放定义和编译器；`control` 管理草稿、发布与实例；`runtime` 执行编译结果；`checkpoint` 协调所有必需分支确认。Go 首版可在一个服务内实现，接口边界不要求微服务边界。
+Rough code modules: `pipeline` holds definitions and the compiler; `control` manages drafts, publishing, and instances; `runtime` executes compiled plans; `checkpoint` coordinates acknowledgment of all required branches. The Go first version may be implemented within a single service; interface boundaries do not imply microservice boundaries.
 
 ```go
 type Compiler interface {
@@ -172,18 +172,18 @@ type Runtime interface {
 }
 ```
 
-这些是接口草图，实际类型在代码框架中统一。`Plan` 至少固定版本、拓扑顺序、节点配置、依赖摘要和必需 sink 集合。运行时处理数据，控制面不逐条调度；一次 binlog 事务对应多个批次和多个 sink 的完成记录，编排图只是其交付路径。
+These are interface sketches; the actual types are unified in the code framework. A `Plan` pins at least the version, topological order, node configurations, dependency digest, and the required sink set. The runtime handles data; the control plane does not schedule record by record; one binlog transaction corresponds to completion records of multiple batches and multiple sinks, and the orchestration graph is only its delivery path.
 
-目标编译顺序：严格解析 JSON → JSON Schema 校验 → 节点/边引用和拓扑校验 → 配额与资源鉴权 → 固定依赖 → 生成规范化计划。当前 CLI 仅以 Go 类型、严格字段解析及结构/图检查覆盖其中一部分；JSON Schema 文件用于契约与工具消费，不代表 CLI 已通过通用 Schema 引擎校验。禁用任意远程 `$ref` 获取和重复 key；未来 YAML 适配器还需禁用自定义 tag，限制文档大小与嵌套，防止编辑器和服务器解释不同配置。连接测试单独执行，不能让 validate 悄悄建立复制连接。
+Target compile order: strict JSON parsing → JSON Schema validation → node/edge reference and topology validation → quota and resource authorization → dependency pinning → normalized plan generation. The current CLI covers only part of this with Go types, strict field parsing, and structural/graph checks; the JSON Schema files serve the contract and tooling consumption and do not mean the CLI has been validated by a generic schema engine. Arbitrary remote `$ref` fetching and duplicate keys are disabled; a future YAML adapter must also disable custom tags and limit document size and nesting to prevent editors and servers from interpreting configurations differently. Connection testing is executed separately; `validate` must not silently open a replication connection.
 
-## 6. 验证清单
+## 6. Verification Checklist
 
-- 后续 YAML 适配器须与对应 JSON 编译为相同计划；当前 JSON 的未知字段、重复 key、错误节点配置明确拒绝。
-- 环路、多来源、汇合、悬挂节点、重复边、未知节点和多级转换按 v1 能力拒绝。
-- 发布后修改草稿不影响旧版本；实例重新调度不改变版本和来源起点。
-- 过滤为空仍完成全部必需分支；一个 sink 失败不能推进事务 checkpoint。
-- 相同幂等 key 不创建重复实例；不同请求复用 key 报错；并发更新草稿返回 `412`。
-- pause 的 `202` 与最终 `PAUSED` 区分；暂停恢复保持实例版本固定。
-- 资源引用、错误日志和实例查询不能跨租户泄露；用户不得通过请求 body 选择其他租户身份。
+- The later YAML adapter must compile to the same plan as the corresponding JSON; the current JSON rejects unknown fields, duplicate keys, and invalid node configurations explicitly.
+- Cycles, multiple sources, merges, dangling nodes, duplicate edges, unknown nodes, and multi-level transforms are rejected per v1 capability.
+- Editing the draft after publish does not affect old versions; instance rescheduling does not change the version or source start position.
+- Empty filtering still completes all required branches; one failing sink must not advance the transaction checkpoint.
+- The same idempotency key does not create duplicate instances; reusing the key with a different request errors; concurrent draft updates return `412`.
+- Pause's `202` is distinguished from the final `PAUSED`; pause/resume keeps the instance version fixed.
+- Resource references, error logs, and instance queries must not leak across tenants; users must not be able to choose another tenant's identity via the request body.
 
-本文各候选标准与官方页面按 2026-10-19 核验；版本号仅说明本次观察，不代表项目依赖会浮动追随最新版本。
+The candidate standards and official pages in this document were verified as of 2026-10-19; version numbers only describe this observation and do not mean project dependencies will float to follow the latest versions.

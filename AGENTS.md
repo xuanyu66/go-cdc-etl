@@ -1,55 +1,55 @@
 # AGENTS.md
 
-面向 AI 编码助手与协作者的项目指南。改动代码前请通读本文件；改动了本文档描述的内容时，请同步更新本文档。
+Project guide for AI coding assistants and collaborators. Read this file before changing code; keep it in sync with the project when you change what it describes.
 
-## 项目一句话
+## One-liner
 
-MySQL binlog CDC → 用户 Lua 转换 → 本地幂等 JSONL 落盘 + 原子提交 manifest 的单用户本地 ETL 工具（Go 1.26+）。当前是 MVP，sink 不是 Iceberg/Parquet/S3。
+A single-user local ETL tool: MySQL binlog CDC → user-defined Lua transforms → local idempotent JSONL sink with atomic commit manifests (Go 1.26+). Currently an MVP; the sink is not Iceberg/Parquet/S3.
 
-## 构建与验证
+## Build and verify
 
 ```bash
-make mysql-up    # 启动 MySQL 8.4 容器（127.0.0.1:13306，e2e 前置）
-make build       # 产出 bin/etl
-make test        # go test ./...（不含需数据库的 e2e）
-make lint        # golangci-lint 全量检查（需安装 golangci-lint）
-make e2e         # 真实 MySQL + HTTP API + Lua 子进程的集成测试，需先 mysql-up
+make mysql-up    # start MySQL 8.4 container (127.0.0.1:13306, e2e prerequisite)
+make build       # build bin/etl
+make test        # go test ./... (excludes DB-dependent e2e)
+make lint        # full golangci-lint check (requires golangci-lint)
+make e2e         # integration tests with real MySQL + HTTP API + Lua subprocess; run mysql-up first
 ```
 
-提交前必须满足：`make lint` 零 issue、`make test` 全绿；改了 CDC/幂等/生命周期逻辑时跑 `make e2e`。
+Before committing: `make lint` must report zero issues and `make test` must be green; run `make e2e` when touching CDC / idempotency / lifecycle logic.
 
-## 目录速查
+## Directory map
 
-| 路径 | 内容 |
+| Path | Content |
 | --- | --- |
-| `cmd/etl` | serve / validate / 隔离进程 Lua worker 命令 |
-| `internal/mysqlcdc` | 真实复制流、事务组装、schema 检查 |
-| `internal/luaruntime` | Lua 函数、精确小数 SDK、子进程执行（时间盒隔离，非资源沙箱） |
-| `internal/localstore` | 幂等写入、manifest/checkpoint、当前结果读取 |
-| `internal/server` | HTTP API、版本与实例生命周期、持久化控制面 |
-| `internal/model`、`pkg/cdc` | 两套 CDC 模型并存（字段类型不统一，见 docs/roadmap.md K20），改这里前先确认走哪套 |
-| `pkg/` 其余包 | 未接入运行链路的接口草案，修改运行链路时不要假设它们生效 |
-| `api/` | OpenAPI 与 JSON Schema，由 `scripts/generate_api.py` 单一事实源生成，改 schema 只改脚本再重新生成 |
-| `docs/` | 设计、用户文档、调研、roadmap |
-| `e2e/` | Go 集成测试 |
+| `cmd/etl` | serve / validate / isolated Lua worker subprocess commands |
+| `internal/mysqlcdc` | real replication stream, transaction assembly, schema checks |
+| `internal/luaruntime` | Lua functions, exact-decimal SDK, subprocess execution (time-boxed isolation, not a resource sandbox) |
+| `internal/localstore` | idempotent writes, manifest/checkpoint, current-output reads |
+| `internal/server` | HTTP API, version and instance lifecycle, persistent control plane |
+| `internal/model`, `pkg/cdc` | two CDC models coexist (inconsistent field types, see docs/roadmap.md K20); confirm which one a change targets |
+| remaining `pkg/` | interface drafts not wired into the runtime path; do not assume they take effect when modifying the runtime |
+| `api/` | OpenAPI and JSON Schema, generated from `scripts/generate_api.py` as the single source of truth; change the script, then regenerate |
+| `docs/` | design, user guide, research, roadmap |
+| `e2e/` | Go integration tests |
 
-## 硬性约定
+## Hard rules
 
-1. **文档诚实优先**：新增功能必须同步更新 `docs/user-guide.md` 与 OpenAPI；未实现的能力在文档中显式标注"未实现"，禁止过度承诺。这是本项目的核心纪律。
-2. **契约三方同步**：HTTP 行为 ↔ `internal/server` ↔ `api/openapi.json` 必须一致；改 API 后运行 `scripts/generate_api.py` 并 diff `api/` 确认无漂移。
-3. **幂等链不可破坏**：transaction ID 内容寻址 + manifest 原子发布 + 文件 checksum 是核心正确性保证。任何改动不得引入"写一半即可见"的中间态；checkpoint 只能在成功提交后推进。
-4. **Lua 隔离边界**：worker 是独立子进程 + 2s 时间盒 + 空环境变量，**不是安全沙箱**（不限内存）。不要把需要资源隔离的不可信代码执行需求往里塞，除非同步实现 RLIMIT/cgroup（见 roadmap K4）。
-5. **锁粒度**：`internal/server` 的全局锁只应保护 catalog 短临界区，禁止在持锁期间新增网络 I/O 或子进程调用（现有问题见 roadmap K1，修复中不要回退）。
-6. **中文文档**：docs 与 README 用中文；代码、commit message、API 错误文本用英文。
+1. **Docs honesty first**: new features must update `docs/user-guide.md` and the OpenAPI contract; capabilities that are not implemented must be explicitly labeled "not implemented" — never over-promise. This is the project's core discipline.
+2. **Three-way contract sync**: HTTP behavior ↔ `internal/server` ↔ `api/openapi.json` must stay consistent; after API changes run `scripts/generate_api.py` and diff `api/` to confirm zero drift.
+3. **The idempotency chain is untouchable**: transaction-ID content addressing + atomic manifest publish + file checksums are the core correctness guarantee. No change may introduce a partially-visible intermediate state; the checkpoint may only advance after a successful commit.
+4. **Lua isolation boundary**: the worker is a separate subprocess + 2s time box + empty environment — **not a security sandbox** (no memory limits). Do not add requirements that need resource isolation for untrusted code execution unless RLIMIT/cgroup support lands in the same change (see roadmap K4).
+5. **Lock granularity**: the global lock in `internal/server` must only protect short catalog critical sections; never add network I/O or subprocess calls while holding it (the existing problem is roadmap K1 — do not regress it).
+6. **English everywhere**: docs, README, code, commit messages, and API error text are all in English.
 
-## 常见坑
+## Common pitfalls
 
-- e2e 不会自动起容器：`make e2e` 前先 `make mysql-up`，否则相关测试被跳过且不易察觉。
-- MySQL 前置条件：源需 ROW/FULL binlog、binlog 未过期、未开 `binlog_transaction_compression`（遇 `TRANSACTION_PAYLOAD_EVENT` 会停止，见 roadmap K7）。
-- 错误处理：当前内部错误统一返回 422 并透出 detail（已知缺陷 K5），新增代码不要扩大这一模式——内部错误用 500/503。
-- 幂等冲突（`IDEMPOTENT_CONFLICT` / `SEQUENCE_GAP` / `CONTENT_CONFLICT`）是终态语义，不要私自添加自动重试掩盖。
-- `catalog.json`（控制面）与 store manifest（数据面）是两套持久化真相，崩溃恢复靠各自幂等拼回；改动任一侧的写入路径时对照 roadmap K18 评估。
+- e2e does not start the container itself: run `make mysql-up` before `make e2e`, or DB-dependent tests are silently skipped.
+- MySQL prerequisites: source must have ROW/FULL binlog, binlogs must not have expired, and `binlog_transaction_compression` must be off (a `TRANSACTION_PAYLOAD_EVENT` stops the instance, see roadmap K7).
+- Error handling: internal errors currently return 422 and leak detail (known defect K5); do not extend this pattern in new code — internal errors should use 500/503.
+- Idempotency conflicts (`IDEMPOTENT_CONFLICT` / `SEQUENCE_GAP` / `CONTENT_CONFLICT`) are terminal semantics; do not paper over them with silent retries.
+- `catalog.json` (control plane) and the store manifest (data plane) are two separate persistence truths; crash recovery relies on each side's idempotency. When changing either write path, evaluate against roadmap K18.
 
-## 规划参照
+## Planning reference
 
-已知缺陷与能力缺口集中维护在 [docs/roadmap.md](docs/roadmap.md)。领新任务前先查该文档：修 bug 时在对应条目标注进展，引入新限制（如容量上限）时新增条目。
+Known defects and capability gaps are maintained in [docs/roadmap.md](docs/roadmap.md). Check it before starting a task: note progress on the corresponding entry when fixing a bug, and add an entry when introducing a new limitation (e.g. a capacity cap).
