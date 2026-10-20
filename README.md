@@ -1,10 +1,23 @@
-# Go CDC + Lua Local MVP
+# go-cdc-etl
 
-Real MySQL binlog → user Lua transforms → local idempotent JSONL + atomic commit manifest.
+[![CI](https://github.com/xuanyu66/go-cdc-etl/actions/workflows/ci.yml/badge.svg)](https://github.com/xuanyu66/go-cdc-etl/actions/workflows/ci.yml)
 
-Supports fixed tables, ROW/FULL binlog, incremental-only processing, complex stateless Lua, business-key upsert/delete, multiple outputs, persistent checkpoints, pause/resume, and recovery across process restarts.
+Programmable CDC pipelines in Go: continuously read MySQL binlog, hand committed changes to user-defined transforms, and sink the results with exactly-tracked progress.
 
-This delivery is a single-user local MVP. The actual sink is local disk — **not Iceberg, Parquet, or S3**; Iceberg v2 + Parquet remain follow-up goals. Multi-tenant isolation, distributed scheduling, auto scaling, and cloud buffering are not implemented, and this tool is not intended to run untrusted external code.
+This repository is built in stages. The long-term goal is a multi-tenant platform where users bring a source, transform code, and a destination — starting with MySQL and S3 — with isolation, retries, and consumption progress handled by the platform (see the [design](docs/design.md)). **The code delivered today is the local MVP stage**: the sink is local disk, the runtime is a single process, and transforms run in isolated Lua worker subprocesses. The name "local MVP" describes this stage, not the ceiling of the project.
+
+## Features
+
+Current capabilities (the local MVP):
+
+- Real MySQL binlog consumption with transaction assembly and schema checks (ROW / FULL, InnoDB base tables, fixed table subscriptions)
+- User-defined transforms in Lua: stateless per-event functions with an exact-decimal SDK, executed in time-boxed worker subprocesses
+- Business-key upsert/delete applied to outputs; one event can fan out to multiple outputs
+- Multiple pipelines and outputs, with persistent checkpoints, pause/resume, and recovery across process restarts
+- Idempotent, atomic commits: transaction-ID content addressing + manifest publication + file checksums — no half-visible intermediate state
+- HTTP control plane: functions, pipeline drafts/versions, instance lifecycle, idempotent submission, and output inspection ([OpenAPI](api/openapi.json))
+
+Explicitly **not** implemented yet (tracked in the [roadmap](docs/roadmap.md)): Iceberg/Parquet/S3 sinks, initial full load, CDC reconnect with backoff, GTID, multi-tenant isolation, distributed scheduling, WASM backends, and resource-limited (memory) sandboxing.
 
 ## Getting Started
 
@@ -30,6 +43,7 @@ Then write data to `shop.orders` and query the output by the returned `instance_
 
 ```bash
 make test
+make lint
 make e2e
 ```
 
@@ -49,4 +63,29 @@ make e2e
 | `e2e` | Go integration tests |
 | remaining `pkg` packages | early interface drafts, not yet wired into the runtime path; not additional supported backends |
 
-The [design](docs/design.md) and [research](docs/research/) keep follow-up architecture discussions; the implemented scope of this delivery is authoritative in the [user guide](docs/user-guide.md) and the OpenAPI. Known defects and future plans are in the [roadmap](docs/roadmap.md).
+## Project Stages
+
+| Stage | State | Content |
+| --- | --- | --- |
+| Local MVP | **delivered** (this repo) | Single-process tool; local JSONL sink; Lua subprocess transforms; idempotent atomic commits |
+| Single-node tool | planned ([roadmap P1](docs/roadmap.md)) | CDC reconnect with backoff, operator recovery, scalable output reads, segmented manifests, resource sandboxing |
+| Platform | proposed ([design](docs/design.md)) | Multi-tenant scheduling, S3/Iceberg sinks, WASM transform backends, GTID, autoscaling |
+
+The implemented scope of the current stage is authoritative in the [user guide](docs/user-guide.md) and the OpenAPI; [research](docs/research/) keeps the supporting investigations.
+
+## Architecture
+
+Implemented path (local MVP stage):
+
+```mermaid
+flowchart LR
+    M[MySQL binlog] --> R[Go CDC reader<br/>transaction assembly + schema checks]
+    R --> X[Lua worker subprocess<br/>stateless per-event transform]
+    X --> V[Mutation validation<br/>upsert/delete by business key]
+    V --> S[Local JSONL sink<br/>idempotent writes + atomic manifest]
+    S --> P[Checkpoint<br/>binlog file/position + sequence]
+    API[HTTP control plane<br/>functions / pipelines / instances] --- R
+    API --- S
+```
+
+The control plane owns catalog, instance lifecycle, and desired state; the data path moves one committed transaction at a time from binlog to validated mutation to manifest-published output, advancing the checkpoint only after the commit is durable. The target platform architecture (S3 sink, WASM/Lua/Lambda transform backends, tenant scheduling, PostgreSQL metadata) is documented separately in [design.md](docs/design.md) and is not what runs today.
