@@ -5,11 +5,12 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"example.com/etl/internal/localstore"
-	"example.com/etl/internal/model"
 	"fmt"
 	"regexp"
 	"sort"
+
+	"example.com/etl/internal/localstore"
+	"example.com/etl/internal/model"
 )
 
 const (
@@ -77,9 +78,11 @@ type Plan struct {
 	Definition    Definition `json:"definition"`
 }
 
-var namePattern = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,62}$`)
-var tablePattern = regexp.MustCompile(`^[A-Za-z0-9_]+\.[A-Za-z0-9_]+$`)
-var typePattern = regexp.MustCompile(`^(string|bool|int64|uint64|float64|decimal\([1-9][0-9]?,[0-9]{1,2}\))$`)
+var (
+	namePattern  = regexp.MustCompile(`^[a-z][a-z0-9_-]{0,62}$`)
+	tablePattern = regexp.MustCompile(`^[A-Za-z0-9_]+\.[A-Za-z0-9_]+$`)
+	typePattern  = regexp.MustCompile(`^(string|bool|int64|uint64|float64|decimal\([1-9][0-9]?,[0-9]{1,2}\))$`)
+)
 
 // Compile intentionally supports one source -> one Lua transform -> N local
 // sinks. Arbitrary multi-stage graphs, joins and non-local sinks are rejected.
@@ -251,6 +254,7 @@ func Compile(d Definition) (Plan, error) {
 	hash := sha256.Sum256(raw)
 	return Plan{Digest: "sha256:" + hex.EncodeToString(hash[:]), SourceNode: source, TransformNode: transform, RequiredSinks: sinks, Definition: canonical}, nil
 }
+
 func (p Plan) Source() MySQLConfig {
 	for _, n := range p.Definition.Spec.Nodes {
 		if n.MySQL != nil {
@@ -259,6 +263,7 @@ func (p Plan) Source() MySQLConfig {
 	}
 	return MySQLConfig{}
 }
+
 func (p Plan) Lua() LuaConfig {
 	for _, n := range p.Definition.Spec.Nodes {
 		if n.Lua != nil {
@@ -267,6 +272,7 @@ func (p Plan) Lua() LuaConfig {
 	}
 	return LuaConfig{}
 }
+
 func (p Plan) Outputs() []model.Output {
 	var out []model.Output
 	for _, n := range p.Definition.Spec.Nodes {

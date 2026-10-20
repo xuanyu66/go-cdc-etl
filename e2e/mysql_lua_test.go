@@ -383,6 +383,7 @@ func (h *harness) sql(query string) {
 		h.t.Fatalf("fixture SQL failed: %v\n%s", err, out)
 	}
 }
+
 func (h *harness) open(cfg server.Config) {
 	h.t.Helper()
 	s, err := server.Open(context.Background(), cfg)
@@ -391,6 +392,7 @@ func (h *harness) open(cfg server.Config) {
 	}
 	h.service, h.http = s, httptest.NewServer(s)
 }
+
 func (h *harness) close() {
 	if h.service == nil {
 		return
@@ -403,9 +405,11 @@ func (h *harness) close() {
 	}
 	h.service, h.http = nil, nil
 }
+
 func (h *harness) request(method, path, key string, body any, code int, result any) []byte {
 	return h.requestWithHeaders(method, path, key, "", body, code, result)
 }
+
 func (h *harness) requestWithHeaders(method, path, key, ifMatch string, body any, code int, result any) []byte {
 	h.t.Helper()
 	var reader io.Reader
@@ -446,6 +450,7 @@ func (h *harness) requestWithHeaders(method, path, key, ifMatch string, body any
 	}
 	return raw
 }
+
 func (h *harness) requestRaw(method, path, key string, body []byte, code int) []byte {
 	h.t.Helper()
 	req, err := http.NewRequest(method, h.http.URL+path, bytes.NewReader(body))
@@ -470,10 +475,12 @@ func (h *harness) requestRaw(method, path, key string, body []byte, code int) []
 	}
 	return raw
 }
+
 func (h *harness) post(path string, body any, code int, result any) {
 	h.counter++
 	h.request(http.MethodPost, path, fmt.Sprintf("e2e-%d", h.counter), body, code, result)
 }
+
 func (h *harness) create(table, source string) server.Instance {
 	h.t.Helper()
 	var fn server.Function
@@ -500,14 +507,17 @@ func (h *harness) create(table, source string) server.Instance {
 	h.post("/v1/pipelines/"+draft.ID+"/instances", map[string]string{"version_id": version.ID}, http.StatusCreated, &instance)
 	return instance
 }
+
 func (h *harness) checkpoint(id string) localstore.Checkpoint {
 	var cp localstore.Checkpoint
 	h.request(http.MethodGet, "/v1/instances/"+id+"/checkpoint", "", nil, http.StatusOK, &cp)
 	return cp
 }
+
 func (h *harness) rows(id string) []map[string]any {
 	return h.outputRows(id, "orders")
 }
+
 func (h *harness) outputRows(id, output string) []map[string]any {
 	h.t.Helper()
 	var res struct {
@@ -520,6 +530,7 @@ func (h *harness) outputRows(id, output string) []map[string]any {
 	}
 	return res.Rows
 }
+
 func (h *harness) eventually(label string, f func() bool) {
 	h.t.Helper()
 	deadline := time.Now().Add(20 * time.Second)
@@ -531,6 +542,7 @@ func (h *harness) eventually(label string, f func() bool) {
 	}
 	h.t.Fatalf("timed out waiting for %s", label)
 }
+
 func (h *harness) wantRows(id string, want []map[string]any) {
 	h.t.Helper()
 	var got []map[string]any
@@ -556,6 +568,7 @@ func (h *harness) wantRows(id string, want []map[string]any) {
 		return true
 	})
 }
+
 func (h *harness) state(id, state string, failed bool) server.Instance {
 	h.t.Helper()
 	var status server.Instance
@@ -568,10 +581,12 @@ func (h *harness) state(id, state string, failed bool) server.Instance {
 	})
 	return status
 }
+
 func (h *harness) pause(id string) {
 	h.post("/v1/instances/"+id+"/pause", map[string]any{}, http.StatusAccepted, nil)
 	h.state(id, "PAUSED", false)
 }
+
 func committedFiles(t *testing.T, dir, id string) map[string]string {
 	t.Helper()
 	names, err := filepath.Glob(filepath.Join(dir, "outputs", id, "*.jsonl"))

@@ -35,7 +35,7 @@ func TestSnapshotPairsRowsAndCheckpointDuringCommits(t *testing.T) {
 		}
 		done <- nil
 	}()
-	for n := 0; n < 50; n++ {
+	for range 50 {
 		snapshot, err := s.Snapshot("instance-1", "orders")
 		if err != nil {
 			t.Fatal(err)
@@ -63,6 +63,7 @@ func request() CommitRequest {
 		Records: []model.Envelope{{MutationID: "m1", EventID: "e1", Index: 0, Mutation: model.Mutation{Output: "orders", Operation: "upsert", Key: map[string]any{"id": "18446744073709551615"}, Value: map[string]any{"id": "18446744073709551615", "total": "1234567890123456.78"}}}},
 	}
 }
+
 func openTest(t *testing.T, root string) *Store {
 	t.Helper()
 	s, e := Open(root)
@@ -72,6 +73,7 @@ func openTest(t *testing.T, root string) *Store {
 	t.Cleanup(func() { s.Close() })
 	return s
 }
+
 func TestCommitRecoveryAndDelete(t *testing.T) {
 	root := t.TempDir()
 	s := openTest(t, root)
@@ -119,6 +121,7 @@ func TestCommitRecoveryAndDelete(t *testing.T) {
 		t.Fatal(commits, e)
 	}
 }
+
 func TestValidationAndNoCheckpoint(t *testing.T) {
 	tests := map[string]func(*CommitRequest){
 		"undeclared output": func(r *CommitRequest) { r.Records[0].Mutation.Output = "other" },
@@ -150,6 +153,7 @@ func TestValidationAndNoCheckpoint(t *testing.T) {
 		})
 	}
 }
+
 func TestConflictAndCrashBeforePublish(t *testing.T) {
 	root := t.TempDir()
 	s := openTest(t, root)
@@ -184,6 +188,7 @@ func TestConflictAndCrashBeforePublish(t *testing.T) {
 		t.Fatal(cp, ok, e)
 	}
 }
+
 func TestCancelledAndEmptyTransaction(t *testing.T) {
 	s := openTest(t, t.TempDir())
 	r := request()
@@ -201,6 +206,7 @@ func TestCancelledAndEmptyTransaction(t *testing.T) {
 		t.Fatal(cp, ok, e)
 	}
 }
+
 func TestSymlinkRejected(t *testing.T) {
 	s := openTest(t, t.TempDir())
 	if e := os.Symlink(t.TempDir(), filepath.Join(s.root, "instance-1")); e != nil {

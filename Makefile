@@ -1,9 +1,11 @@
-.PHONY: build test e2e mysql-up mysql-down
+.PHONY: build test lint mysql-up mysql-down e2e
 build:
 	mkdir -p bin
 	go build -o bin/etl ./cmd/etl
 test:
 	go test -race ./...
+lint:
+	golangci-lint run ./...
 mysql-up:
 	docker compose up -d --wait mysql
 mysql-down:

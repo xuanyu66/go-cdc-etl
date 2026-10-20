@@ -1,0 +1,73 @@
+# golangci-lint configuration for go-cdc-etl
+# Docs: https://golangci-lint.run/usage/configuration/
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: standard
+  enable:
+    - bodyclose # check response bodies are closed (HTTP sink/client work)
+    - copyloopvar # detect loop variable copies made redundant by Go 1.22 semantics
+    - errorlint # compare errors with errors.Is/As, wrap with %w
+    - fatcontext # nested contexts stored in structs
+    - gosec # security issues (path traversal, weak crypto, ...)
+    - intrange # for i := range n instead of classic loop
+    - misspell # commonly misspelled English words
+    - nakedret # avoid naked returns in long functions
+    - nilerr # return nil after checking err != nil
+    - noctx # HTTP requests without context
+    - perfsprint # fmt.Sprintf where faster alternatives exist
+    - unconvert # unnecessary type conversions
+    - unparam # unused/constant function parameters
+    - unused # unused identifiers (part of standard set, kept explicit)
+    - whitespace # leading/trailing blank lines in blocks
+
+  settings:
+    errcheck:
+      exclude-functions:
+        # Writes to hash.Hash and CLI output never fail in practice
+        - fmt.Fprint
+        - fmt.Fprintf
+        - fmt.Fprintln
+        # Best-effort cleanup on exit/error paths; Close errors there are not actionable
+        - (*os.File).Close
+        - syscall.Flock
+        - os.Remove
+    gosec:
+      excludes:
+        # False positives on integer-converted-then-used-as-array-index patterns
+        - G115
+        # Unhandled-error detection is covered by errcheck, which supports exclusions
+        - G104
+    nakedret:
+      max-func-lines: 30
+    unparam:
+      check-exported: false
+
+  exclusions:
+    rules:
+      # gosec false positives: all store paths are validated instance directories
+      # (see store.dir), and the worker subprocess path is resolved from
+      # os.Executable() or explicit operator config.
+      - linters: [gosec]
+        text: "Potential file inclusion via variable|Subprocess launched with variable"
+      # Tests favor readability over strict error checking and security hardening
+      - path: _test\.go
+        linters:
+          - bodyclose
+          - errcheck
+          - gosec
+          - perfsprint
+          - unparam
+      # Generated API contract is the single source of truth; not Go code
+      - path: api/
+        linters:
+          - all
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+    - gofumpt

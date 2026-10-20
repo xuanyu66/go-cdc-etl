@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -86,15 +87,15 @@ type Server struct {
 
 func Open(parent context.Context, cfg Config) (*Server, error) {
 	if cfg.DataDir == "" {
-		return nil, fmt.Errorf("data directory required")
+		return nil, errors.New("data directory required")
 	}
 	if cfg.WorkerExecutable == "" {
-		return nil, fmt.Errorf("worker executable required")
+		return nil, errors.New("worker executable required")
 	}
-	if err := os.MkdirAll(cfg.DataDir, 0700); err != nil {
+	if err := os.MkdirAll(cfg.DataDir, 0o700); err != nil {
 		return nil, err
 	}
-	lock, err := os.OpenFile(filepath.Join(cfg.DataDir, ".server.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	lock, err := os.OpenFile(filepath.Join(cfg.DataDir, ".server.lock"), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -113,16 +114,16 @@ func Open(parent context.Context, cfg Config) (*Server, error) {
 	raw, err := os.ReadFile(filepath.Join(cfg.DataDir, "catalog.json"))
 	if err == nil {
 		if err = json.Unmarshal(raw, &s.data); err != nil {
-			s.Close(context.Background())
+			_ = s.Close(context.Background())
 			return nil, fmt.Errorf("invalid catalog: %w", err)
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
-		s.Close(context.Background())
+		_ = s.Close(context.Background())
 		return nil, err
 	}
 	if s.data.Functions == nil || s.data.Pipelines == nil || s.data.Versions == nil || s.data.Instances == nil || s.data.Idempotency == nil {
-		s.Close(context.Background())
-		return nil, fmt.Errorf("incomplete catalog")
+		_ = s.Close(context.Background())
+		return nil, errors.New("incomplete catalog")
 	}
 	s.routes()
 	s.mu.Lock()
@@ -134,6 +135,7 @@ func Open(parent context.Context, cfg Config) (*Server, error) {
 	s.mu.Unlock()
 	return s, nil
 }
+
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	if r.Method != "GET" && r.Method != "HEAD" && r.Header.Get("Origin") != "" {
@@ -142,6 +144,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	s.mux.ServeHTTP(w, r)
 }
+
 func (s *Server) Close(ctx context.Context) error {
 	s.mu.Lock()
 	if s.closing {
@@ -168,6 +171,7 @@ func (s *Server) Close(ctx context.Context) error {
 	}
 	return err
 }
+
 func atomicJSON(path string, value any) error {
 	b, err := json.MarshalIndent(value, "", "  ")
 	if err != nil {
@@ -179,7 +183,7 @@ func atomicJSON(path string, value any) error {
 	}
 	name := f.Name()
 	defer os.Remove(name)
-	if err = f.Chmod(0600); err == nil {
+	if err = f.Chmod(0o600); err == nil {
 		_, err = f.Write(b)
 	}
 	if err == nil {
@@ -202,9 +206,11 @@ func atomicJSON(path string, value any) error {
 	defer dir.Close()
 	return dir.Sync()
 }
+
 func (s *Server) saveLocked() error {
 	return atomicJSON(filepath.Join(s.cfg.DataDir, "catalog.json"), s.data)
 }
+
 func hash(parts ...string) string {
 	h := sha256.New()
 	for _, part := range parts {
@@ -213,6 +219,7 @@ func hash(parts ...string) string {
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }
+
 func (s *Server) startLocked(id string) {
 	if s.closing {
 		return
@@ -248,6 +255,7 @@ func (s *Server) startLocked(id string) {
 		}
 	}()
 }
+
 func (s *Server) run(ctx context.Context, id string) error {
 	s.mu.Lock()
 	instance := s.data.Instances[id]
@@ -255,7 +263,7 @@ func (s *Server) run(ctx context.Context, id string) error {
 	fn, ok := s.data.Functions[version.Plan.Lua().FunctionRef]
 	s.mu.Unlock()
 	if !ok {
-		return fmt.Errorf("function missing")
+		return errors.New("function missing")
 	}
 	checkpoint, exists, err := s.store.Checkpoint(id)
 	if err != nil {
@@ -298,7 +306,7 @@ func (s *Server) run(ctx context.Context, id string) error {
 				end++
 			}
 			if end == offset {
-				return fmt.Errorf("single event exceeds transform request limit")
+				return errors.New("single event exceeds transform request limit")
 			}
 			callCtx, cancel := context.WithTimeout(ctx, time.Duration(version.Plan.Lua().TimeoutMS)*time.Millisecond)
 			result, callErr := worker.Execute(callCtx, model.TransformRequest{Source: fn.Source, Events: tx.Events[offset:end]})
@@ -307,12 +315,12 @@ func (s *Server) run(ctx context.Context, id string) error {
 				return fmt.Errorf("transform failed: %w", callErr)
 			}
 			if len(result.Results) != end-offset {
-				return fmt.Errorf("transform result count mismatch")
+				return errors.New("transform result count mismatch")
 			}
 			for index, mutations := range result.Results {
 				event := tx.Events[offset+index]
 				for j, mutation := range mutations {
-					records = append(records, model.Envelope{MutationID: hash(id, instance.VersionID, event.ID, fmt.Sprint(j)), EventID: event.ID, Index: j, Mutation: mutation})
+					records = append(records, model.Envelope{MutationID: hash(id, instance.VersionID, event.ID, strconv.Itoa(j)), EventID: event.ID, Index: j, Mutation: mutation})
 				}
 			}
 			offset = end
@@ -325,6 +333,7 @@ func (s *Server) run(ctx context.Context, id string) error {
 		return nil
 	})
 }
+
 func sortedDrafts(m map[string]Draft) []Draft {
 	out := make([]Draft, 0, len(m))
 	for _, v := range m {

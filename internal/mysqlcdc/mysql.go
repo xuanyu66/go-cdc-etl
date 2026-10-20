@@ -7,6 +7,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"reflect"
@@ -41,6 +42,7 @@ type Config struct {
 func literal(s string) string {
 	return "CONVERT(0x" + hex.EncodeToString([]byte(s)) + " USING utf8mb4)"
 }
+
 func splitTable(s string) (string, string, error) {
 	p := strings.Split(s, ".")
 	if len(p) != 2 || p[0] == "" || p[1] == "" || strings.ContainsAny(s, "*`\x00") {
@@ -48,9 +50,11 @@ func splitTable(s string) (string, string, error) {
 	}
 	return p[0], p[1], nil
 }
+
 func baseType(s string) string {
 	return strings.Fields(strings.SplitN(strings.ToLower(s), "(", 2)[0])[0]
 }
+
 func supported(t string) bool {
 	switch baseType(t) {
 	case "tinyint", "smallint", "mediumint", "int", "bigint", "decimal", "char", "varchar", "tinytext", "text", "mediumtext", "longtext", "binary", "varbinary", "tinyblob", "blob", "mediumblob", "longblob", "json", "date", "datetime", "timestamp", "time", "year":
@@ -63,7 +67,7 @@ func supported(t string) bool {
 func Probe(ctx context.Context, c Connection, tables []string) (ProbeResult, error) {
 	out := ProbeResult{Tables: map[string][]model.Column{}}
 	if len(tables) == 0 {
-		return out, fmt.Errorf("at least one exact table is required")
+		return out, errors.New("at least one exact table is required")
 	}
 	conn, err := client.ConnectWithContext(ctx, c.Addr, c.User, c.Password, "", 5*time.Second, func(conn *client.Conn) error {
 		conn.ReadTimeout = 5 * time.Second
@@ -73,7 +77,7 @@ func Probe(ctx context.Context, c Connection, tables []string) (ProbeResult, err
 	if err != nil {
 		return out, err
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	r, err := conn.Execute("SELECT @@global.log_bin, @@global.binlog_format, @@global.binlog_row_image, @@server_uuid")
 	if err != nil {
 		return out, err
@@ -83,7 +87,7 @@ func Probe(ctx context.Context, c Connection, tables []string) (ProbeResult, err
 	image, _ := r.GetString(0, 2)
 	out.ServerUUID, _ = r.GetString(0, 3)
 	if enabled != "1" || format != "ROW" || image != "FULL" {
-		return out, fmt.Errorf("MySQL requires log_bin=ON, binlog_format=ROW, binlog_row_image=FULL")
+		return out, errors.New("MySQL requires log_bin=ON, binlog_format=ROW, binlog_row_image=FULL")
 	}
 	for _, table := range tables {
 		db, name, e := splitTable(table)
@@ -111,7 +115,7 @@ func Probe(ctx context.Context, c Connection, tables []string) (ProbeResult, err
 			return out, e
 		}
 		cols := []model.Column{}
-		for i := 0; i < r.RowNumber(); i++ {
+		for i := range r.RowNumber() {
 			n, _ := r.GetString(i, 0)
 			t, _ := r.GetString(i, 1)
 			nullable, _ := r.GetString(i, 2)
@@ -140,16 +144,17 @@ func Probe(ctx context.Context, c Connection, tables []string) (ProbeResult, err
 		return out, err
 	}
 	if r.RowNumber() != 1 {
-		return out, fmt.Errorf("no binary log position")
+		return out, errors.New("no binary log position")
 	}
 	out.Position.File, _ = r.GetString(0, 0)
 	pos, e := r.GetUint(0, 1)
 	if e != nil || pos > uint64(^uint32(0)) {
-		return out, fmt.Errorf("invalid binlog position")
+		return out, errors.New("invalid binlog position")
 	}
 	out.Position.Offset = uint32(pos)
 	return out, nil
 }
+
 func identity(parts ...string) string {
 	h := sha256.New()
 	for _, p := range parts {
@@ -162,14 +167,14 @@ func identity(parts ...string) string {
 // acknowledged checkpoint authoritative; the syncer does not retry internally.
 func Read(ctx context.Context, c Config, deliver func(model.Transaction) error) error {
 	if c.Start.File == "" || c.Start.Offset < 4 || c.SourceID == "" || c.Connection.ServerID == 0 {
-		return fmt.Errorf("source ID, server ID and file position >= 4 are required")
+		return errors.New("source ID, server ID and file position >= 4 are required")
 	}
 	probe, err := Probe(ctx, c.Connection, c.Tables)
 	if err != nil {
 		return err
 	}
 	if probe.ServerUUID != c.SourceID {
-		return fmt.Errorf("source identity changed; refusing file-position recovery on a different MySQL server")
+		return errors.New("source identity changed; refusing file-position recovery on a different MySQL server")
 	}
 	for _, t := range c.Tables {
 		if !reflect.DeepEqual(probe.Tables[t], c.ExpectedSchemas[t]) {
@@ -216,7 +221,7 @@ func Read(ctx context.Context, c Config, deliver func(model.Transaction) error) 
 		switch v := ev.Event.(type) {
 		case *replication.RotateEvent:
 			if txnStart != "" || len(events) > 0 {
-				return fmt.Errorf("unexpected binlog rotation within transaction")
+				return errors.New("unexpected binlog rotation within transaction")
 			}
 			file = string(v.NextLogName)
 		case *replication.QueryEvent:
@@ -224,7 +229,7 @@ func Read(ctx context.Context, c Config, deliver func(model.Transaction) error) 
 			switch q {
 			case "BEGIN":
 				if txnStart != "" {
-					return fmt.Errorf("nested transaction")
+					return errors.New("nested transaction")
 				}
 				txnStart = fmt.Sprintf("%s:%d", file, ev.Header.LogPos)
 			case "COMMIT":
@@ -259,7 +264,7 @@ func Read(ctx context.Context, c Config, deliver func(model.Transaction) error) 
 				continue
 			}
 			if txnStart == "" {
-				return fmt.Errorf("rows outside a BEGIN transaction")
+				return errors.New("rows outside a BEGIN transaction")
 			}
 			if e = validateTable(v.Table, cols); e != nil {
 				return fmt.Errorf("%s: %w", table, e)
@@ -283,7 +288,7 @@ func Read(ctx context.Context, c Config, deliver func(model.Transaction) error) 
 				return fmt.Errorf("unsupported row event %s", ev.Header.EventType)
 			}
 			if len(v.Rows)%step != 0 {
-				return fmt.Errorf("invalid row image count")
+				return errors.New("invalid row image count")
 			}
 			for i := 0; i < len(v.Rows); i += step {
 				a, e := convertRow(v.Rows[i], cols)
@@ -310,7 +315,7 @@ func Read(ctx context.Context, c Config, deliver func(model.Transaction) error) 
 				}
 				bytes += len(b)
 				if len(events) >= 10000 || bytes > 16*1024*1024 {
-					return fmt.Errorf("transaction exceeds MVP limit (10000 subscribed events / 16 MiB encoded events)")
+					return errors.New("transaction exceeds MVP limit (10000 subscribed events / 16 MiB encoded events)")
 				}
 				events = append(events, event)
 				rowIndex++
@@ -318,9 +323,10 @@ func Read(ctx context.Context, c Config, deliver func(model.Transaction) error) 
 		}
 	}
 }
+
 func validateTable(t *replication.TableMapEvent, cols []model.Column) error {
 	if int(t.ColumnCount) != len(cols) || len(t.ColumnType) != len(cols) {
-		return fmt.Errorf("column count changed")
+		return errors.New("column count changed")
 	}
 	for i, c := range cols {
 		var allowed []byte
@@ -364,14 +370,15 @@ func validateTable(t *replication.TableMapEvent, cols []model.Column) error {
 			return fmt.Errorf("column %s wire type changed", c.Name)
 		}
 		if len(t.ColumnName) > i && string(t.ColumnName[i]) != c.Name {
-			return fmt.Errorf("column name changed")
+			return errors.New("column name changed")
 		}
 	}
 	return nil
 }
+
 func convertRow(row []any, cols []model.Column) (map[string]any, error) {
 	if len(row) != len(cols) {
-		return nil, fmt.Errorf("incomplete row")
+		return nil, errors.New("incomplete row")
 	}
 	out := map[string]any{}
 	for i, c := range cols {
@@ -421,7 +428,7 @@ func convertRow(row []any, cols []model.Column) (map[string]any, error) {
 			case string:
 				out[c.Name] = base64.StdEncoding.EncodeToString([]byte(x))
 			default:
-				return nil, fmt.Errorf("unexpected binary value")
+				return nil, errors.New("unexpected binary value")
 			}
 		default:
 			var s string

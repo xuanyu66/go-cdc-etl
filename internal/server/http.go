@@ -28,6 +28,7 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
 }
+
 func problem(w http.ResponseWriter, err error) {
 	status, code := 422, "INVALID_REQUEST"
 	var ae *apiError
@@ -43,6 +44,7 @@ func problem(w http.ResponseWriter, err error) {
 	}
 	_ = json.NewEncoder(w).Encode(body)
 }
+
 func bodyBytes(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 	media := strings.Split(r.Header.Get("Content-Type"), ";")[0]
 	if media != "application/json" {
@@ -58,6 +60,7 @@ func bodyBytes(w http.ResponseWriter, r *http.Request) ([]byte, error) {
 	}
 	return raw, nil
 }
+
 func decode(raw []byte, out any) error {
 	d := json.NewDecoder(strings.NewReader(string(raw)))
 	d.DisallowUnknownFields()
@@ -129,6 +132,7 @@ func (s *Server) mutate(w http.ResponseWriter, r *http.Request, fn mutation) {
 	}
 	writeJSON(w, status, value)
 }
+
 func (s *Server) routes() {
 	s.mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]any{"status": "ok", "mode": "local-mvp"})
