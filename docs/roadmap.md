@@ -47,10 +47,10 @@ Relative to a production CDC/ETL product, the MVP deliberately skips the followi
 
 | Capability | Current state | Plan |
 | --- | --- | --- |
-| CI | no `.github/workflows`; tests do not run on push | GitHub Actions: gofmt + `go vet` + `go test ./...` |
+| CI | **delivered**: `.github/workflows/ci.yml` runs golangci-lint, gofmt/vet, `go test -race`, and e2e against a real MySQL container on every push and PR | — |
 | Failure-injection e2e | only graceful `Close()` restart; no SIGKILL/worker-kill/disconnect scenarios | kill -9 mid-crash recovery, kill Lua worker mid-execution, source disconnect/reconnect |
 | Fate of the `pkg/` draft packages | `buffer`/`cdc`/`checkpoint`/`listener`/`orchestrator`/`sink`/`transform` have zero tests and are not wired in | wire them in or demote to docs attachments to avoid a "dead code" impression |
-| README architecture diagram | only the not-implemented-vision mermaid exists (`docs/design.md:26`) | add a diagram of the actual MVP path (binlog → listener → Lua subprocess → manifest) |
+| README architecture diagram | **delivered**: implemented-path mermaid diagram in [README](../README.md) | — |
 | LICENSE | missing | add MIT/Apache-2.0 |
 
 ### P1 — from MVP to a credible single-node tool

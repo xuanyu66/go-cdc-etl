@@ -1,5 +1,7 @@
 # go-cdc-etl
 
+[![CI](https://github.com/xuanyu66/go-cdc-etl/actions/workflows/ci.yml/badge.svg)](https://github.com/xuanyu66/go-cdc-etl/actions/workflows/ci.yml)
+
 Programmable CDC pipelines in Go: continuously read MySQL binlog, hand committed changes to user-defined transforms, and sink the results with exactly-tracked progress.
 
 This repository is built in stages. The long-term goal is a multi-tenant platform where users bring a source, transform code, and a destination — starting with MySQL and S3 — with isolation, retries, and consumption progress handled by the platform (see the [design](docs/design.md)). **The code delivered today is the local MVP stage**: the sink is local disk, the runtime is a single process, and transforms run in isolated Lua worker subprocesses. The name "local MVP" describes this stage, not the ceiling of the project.
